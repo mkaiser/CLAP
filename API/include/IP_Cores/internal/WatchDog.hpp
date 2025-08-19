@@ -28,7 +28,6 @@
 
 #include <condition_variable>
 #include <cstdint>
-#include <functional>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -50,19 +49,19 @@ namespace clap
 {
 namespace internal
 {
-static std::exception_ptr g_pExcept = nullptr;
-static int64_t g_pollSleepTimeMS    = 10;
-
-// TODO: Rename to indicate that this also controls whether the thread should be terminated
-// TODO: Replace the bool with an enum
-using WatchDogFinishCallback = std::function<bool(void)>;
+inline std::exception_ptr g_pExcept = nullptr;
+#ifdef EMBEDDED_XILINX
+inline int64_t g_sleepTimeUS        = 10;
+#else
+inline int64_t g_pollSleepTimeMS    = 10;
+#endif
 
 // TODO: Calling WaitForInterrupt with a non-infinit timeout and checking the threadDone flag is not the best solution.
 //       Find a better way, i.e., a way to interrupt the call to poll (ppoll or epoll might be a solution)
 
 #ifndef EMBEDDED_XILINX
 static void waitForFinishThread(UserInterruptBase* pUserIntr, HasStatus* pStatus, Timer* pTimer, [[maybe_unused]] std::condition_variable* pCv, [[maybe_unused]] const std::string& name,
-								std::atomic<bool>* pThreadDone, [[maybe_unused]] const bool& dontTerminate, [[maybe_unused]] const WatchDogFinishCallback& callback)
+								std::atomic<bool>* pThreadDone, [[maybe_unused]] const bool& dontTerminate)
 {
 	pThreadDone->store(false, std::memory_order_release);
 	pTimer->Start();
@@ -80,18 +79,41 @@ static void waitForFinishThread(UserInterruptBase* pUserIntr, HasStatus* pStatus
 		{
 			if (pUserIntr->IsSet())
 			{
-				while (!pThreadDone->load(std::memory_order_acquire) && !pUserIntr->WaitForInterrupt(100))
-					;
+				while (true)
+				{
+					if (pThreadDone->load(std::memory_order_acquire)) break;
+
+					pUserIntr->WaitForInterrupt(100);
+
+					if (!pUserIntr->HasStatusReg()) break;
+
+					if (pUserIntr->HasDoneIntr()) break;
+					if (pUserIntr->HasErrorIntr())
+					{
+						CLAP_LOG_ERROR << "[" << name << "] an error interrupt was triggered" << std::endl;
+						break;
+					}
+				}
+
+				// Once an interrupt was detected, the internal state is reset to prevent carrying over the interrupt to the next call
+				if(pUserIntr->HasStatusReg())
+					pUserIntr->ResetStates();
 			}
 			else if (pStatus)
 			{
 				while (!pThreadDone->load(std::memory_order_acquire) && !pStatus->PollDone())
-					std::this_thread::sleep_for(std::chrono::milliseconds(g_pollSleepTimeMS));
+					utils::SleepMS(g_pollSleepTimeMS);
 			}
 
 			const bool forceTerminate = pThreadDone->load(std::memory_order_acquire);
-			if (!forceTerminate && callback)
-				end = callback();
+			if (!forceTerminate && pUserIntr->HasFinishedCallback())
+			{
+				// The Finished callback will be called by the interrupt handler once the interrupt is received
+				if (pUserIntr->IsSet())
+					end = pUserIntr->IsIpCoreFinished();
+				else // When polling, the Finished callback is called here -- TODO: This might still not be the best position
+					end = pUserIntr->CallIpCoreFinishCallback();
+			}
 
 		} while (!pThreadDone->load(std::memory_order_acquire) && dontTerminate && !end);
 	}
@@ -141,18 +163,18 @@ public:
 
 	void SetUserInterrupt(UserInterruptPtr pInterrupt)
 	{
-		m_pInterrupt->TransferCallbacks(pInterrupt.get());
+		m_pInterrupt->Transfer(pInterrupt.get());
 		m_pInterrupt = std::move(pInterrupt);
 	}
 
 	void InitInterrupt([[maybe_unused]] const uint32_t& devNum, [[maybe_unused]] const uint32_t& interruptNum, [[maybe_unused]] HasInterrupt* pReg = nullptr)
 	{
 #ifdef _WIN32
-		CLAP_LOG_ERROR << CLASS_TAG("WatchDog") << "Error: Interrupts are not supported on Windows." << std::endl;
+		CLAP_CLASS_LOG_ERROR << "Error: Interrupts are not supported on Windows." << std::endl;
 #else
 		m_pInterrupt->Init(devNum, interruptNum, pReg);
 		// Check for existing interrupts and clear them
-		CLAP_LOG_DEBUG << CLASS_TAG("WatchDog") << "Clearing existing interrupts ..." << std::endl;
+		CLAP_CLASS_LOG_DEBUG << "Clearing existing interrupts ..." << std::endl;
 		while (m_pInterrupt->WaitForInterrupt(1))
 			;
 
@@ -162,7 +184,7 @@ public:
 	void UnsetInterrupt()
 	{
 #ifdef _WIN32
-		CLAP_LOG_ERROR << CLASS_TAG("WatchDog") << "Error: Interrupts are not supported on Windows." << std::endl;
+		CLAP_CLASS_LOG_ERROR << "Error: Interrupts are not supported on Windows." << std::endl;
 #else
 		m_pInterrupt->Unset();
 #endif
@@ -190,13 +212,13 @@ public:
 		if (!m_pInterrupt->IsSet() && m_pStatus == nullptr)
 		{
 			std::stringstream ss("");
-			ss << CLASS_TAG("WatchDog") << "Error: Trying to start WatchDog thread with neither the interrupt nor the status register set.";
+			ss << CLASS_TAG_AUTO << "Error: Tried to start WatchDog thread with neither the interrupt nor the status register set.";
 			throw WatchDogException(ss.str());
 		}
 
 		g_pExcept = nullptr;
 		m_threadDone.store(false, std::memory_order_release);
-		m_waitThread    = std::thread(waitForFinishThread, m_pInterrupt.get(), m_pStatus, &m_timer, &m_cv, m_name, &m_threadDone, dontTerminate, m_callback);
+		m_waitThread    = std::thread(waitForFinishThread, m_pInterrupt.get(), m_pStatus, &m_timer, &m_cv, m_name, &m_threadDone, dontTerminate);
 		m_threadRunning = true;
 #endif
 
@@ -215,12 +237,18 @@ public:
 #endif
 	}
 
-	bool WaitForFinish(const int32_t& timeoutMS = WAIT_INFINITE)
+	/// @brief Waits for the thread to finish
+	/// @details This function will block until the thread has finished or the timeout has been reached.
+	/// @details If the timeout is set to WAIT_INFINITE, the function will block until the thread has finished.
+	/// @details If the thread has already finished, the function will return immediately.
+	/// @param timeout The timeout in microseconds for BareMetal or milliseconds for Linux. Default is WAIT_INFINITE, which means no timeout.
+	/// @return True if the thread has finished, false if the timeout was reached.
+	bool WaitForFinish(const int32_t& timeout = WAIT_INFINITE)
 	{
 #ifndef EMBEDDED_XILINX
 		using namespace std::chrono_literals;
 
-		CLAP_LOG_DEBUG << CLASS_TAG("WatchDog") << "Core=" << m_name << " timeoutMS=" << (timeoutMS == WAIT_INFINITE ? "Infinite" : std::to_string(timeoutMS)) << std::endl;
+		CLAP_CLASS_LOG_DEBUG << "Core=" << m_name << " timeout=" << (timeout == WAIT_INFINITE ? "Infinite" : std::to_string(timeout) + " ms") << std::endl;
 
 		if (!m_threadRunning)
 			return true;
@@ -232,29 +260,43 @@ public:
 			return true;
 		}
 
-		std::mutex mtx;
-		std::unique_lock<std::mutex> lck(mtx);
+		{
+			std::unique_lock<std::mutex> lck(m_mtx);
 
-		if (timeoutMS == WAIT_INFINITE)
-			m_cv.wait(lck, [this] { return m_threadDone.load(std::memory_order_acquire); });
-		else if (m_cv.wait_for(lck, std::chrono::milliseconds(timeoutMS)) == std::cv_status::timeout)
-			return false;
+			if (timeout == WAIT_INFINITE)
+				m_cv.wait(lck, [this] { return m_threadDone.load(std::memory_order_acquire); });
+			else if (m_cv.wait_for(lck, std::chrono::milliseconds(timeout)) == std::cv_status::timeout)
+				return false;
+		}
 
 		joinThread();
 		checkException();
 #else
+		int32_t sleepTimeUS = 0;
+
 		if (m_pInterrupt->IsSet())
 		{
-			while (!m_pInterrupt->WaitForInterrupt())
-				usleep(1);
+			while (!m_pInterrupt->WaitForInterrupt(timeout))
+			{
+				if (timeout != WAIT_INFINITE)
+					return false;
+
+				utils::SleepUS(g_sleepTimeUS);
+			}
 		}
 		else if (m_pStatus != nullptr)
 		{
 			while (!m_pStatus->PollDone())
-				usleep(1);
+			{
+				if (timeout != WAIT_INFINITE)
+				{
+					if (sleepTimeUS > timeout)
+						return false;
+				}
+				utils::SleepUS(g_sleepTimeUS);
+				sleepTimeUS += g_sleepTimeUS;
+			}
 		}
-
-		m_callback();
 #endif
 
 		return true;
@@ -265,14 +307,14 @@ public:
 		return m_timer.GetElapsedTimeInMilliSec();
 	}
 
-	void RegisterInterruptCallback(const std::function<void(uint32_t)>& callback)
+	void RegisterInterruptCallback(const IntrCallback& callback)
 	{
 		m_pInterrupt->RegisterCallback(callback);
 	}
 
-	void SetFinishCallback(WatchDogFinishCallback callback)
+	void SetIPCoreFinishCallback(IPCoreFinishCallback callback)
 	{
-		m_callback = callback;
+		m_pInterrupt->SetIPCoreFinishCallback(callback);
 	}
 
 private:
@@ -314,14 +356,20 @@ private:
 	bool m_threadRunning = false;
 	std::atomic<bool> m_threadDone;
 #endif
-	WatchDogFinishCallback m_callback = nullptr;
-	HasStatus* m_pStatus              = nullptr;
+	HasStatus* m_pStatus = nullptr;
 };
 } // namespace internal
 
-static inline void SetWatchDogPollSleepTimeMS(const uint32_t& timeMS = 10)
+#ifdef EMBEDDED_XILINX
+inline void SetWatchDogSleepTimeUS(const uint32_t& timeUS = 10)
+{
+	internal::g_sleepTimeUS = timeUS;
+}
+#else
+inline void SetWatchDogPollSleepTimeMS(const uint32_t& timeMS = 10)
 {
 	internal::g_pollSleepTimeMS = timeMS;
 }
+#endif
 
 } // namespace clap

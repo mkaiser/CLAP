@@ -6,9 +6,9 @@
 #include <IP_Cores/AxiGPIO.hpp>
 #include <IP_Cores/AxiInterruptController.hpp>
 
-static constexpr uint64_t AXI_GPIO_1_BASE_ADDR           = 0x41200000;
-static constexpr uint64_t AXI_GPIO_2_BASE_ADDR           = 0x41210000;
-static constexpr uint64_t AXI_INTERRUPT_CONTROLLER_BASE_ADDR = 0x41800000;
+[[maybe_unused]] static constexpr uint64_t AXI_GPIO_1_BASE_ADDR           = 0x41200000;
+[[maybe_unused]] static constexpr uint64_t AXI_GPIO_2_BASE_ADDR           = 0x41210000;
+[[maybe_unused]] static constexpr uint64_t AXI_INTERRUPT_CONTROLLER_BASE_ADDR = 0x41800000;
 
 volatile bool intrDone = false;
 
@@ -57,8 +57,6 @@ int main()
 
 //		axiGPIO1.SetGPIOBit(clap::AxiGPIO::CHANNEL_2, 0, true);
 
-		// Wait for 10 seconds
-		//std::this_thread::sleep_for(std::chrono::seconds(10));
 		while(!intrDone);
 
 		std::cout << "-------AFTER INTR-------" << std::endl;

@@ -52,6 +52,11 @@ public:
 		return instance;
 	}
 
+	static bool Cleanup()
+	{
+		return unlink(LOCK_FILE.c_str()) == 0;
+	}
+
 	SoloRunWarden(SoloRunWarden const&)  = delete;
 	void operator=(SoloRunWarden const&) = delete;
 
@@ -59,7 +64,7 @@ private:
 	SoloRunWarden()
 	{
 		int lockFile = open(LOCK_FILE.c_str(), O_CREAT | O_EXCL | O_RDWR, 0666);
-		if (lockFile == -1)
+		if (lockFile == INVALID_HANDLE)
 		{
 			// file already exists
 			std::ifstream lockFileIn(LOCK_FILE);
@@ -70,17 +75,17 @@ private:
 			if (kill(pid, 0) == 0)
 			{
 				// Process is still running
-				CLAP_LOG_ERROR << CLASS_TAG("SoloRunWarden") << "Error: Another instance of this program is already running" << std::endl;
+				CLAP_CLASS_LOG_ERROR << "Error: Another instance of this program is already running" << std::endl;
 				exit(1);
 			}
 			else
 			{
-				CLAP_LOG_WARNING << CLASS_TAG("SoloRunWarden") << "Warning: Lock file exists but process is not running - deleting lock file and continuing" << std::endl;
+				CLAP_CLASS_LOG_WARNING << "Warning: Lock file exists but process is not running - deleting lock file and continuing" << std::endl;
 
 				// Process is not running
-				if (unlink(LOCK_FILE.c_str()) != 0)
+				if (!Cleanup())
 				{
-					CLAP_LOG_ERROR << CLASS_TAG("SoloRunWarden") << "Error: Unable to delete lock file (" << LOCK_FILE << ") - Please delete it manually and restart the application" << std::endl;
+					CLAP_CLASS_LOG_ERROR << "Error: Unable to delete lock file (" << LOCK_FILE << ") - Please delete it manually and restart the application" << std::endl;
 					exit(1);
 				}
 			}
@@ -93,27 +98,29 @@ private:
 		// Make sure the file was created successfully
 		if (!lockFileOut.is_open())
 		{
-			CLAP_LOG_ERROR << CLASS_TAG("SoloRunWarden") << "Error: Unable to create lock file" << std::endl;
+			CLAP_CLASS_LOG_ERROR << "Error: Unable to create lock file" << std::endl;
 			exit(1);
 		}
 
 		lockFileOut << getpid();
 		lockFileOut.close();
 
+#ifndef CLAP_DISABLE_SRW_SIG_HANDLER
 		// Catch SIGINT and SIGTERM to delete the lock file before exiting
 		signal(SIGINT, signalHandler);
 		signal(SIGTERM, signalHandler);
+#endif
 	}
 
 	~SoloRunWarden()
 	{
-		unlink(LOCK_FILE.c_str());
+		Cleanup();
 	}
 
 private:
 	static void signalHandler([[maybe_unused]] int signal)
 	{
-		unlink(LOCK_FILE.c_str());
+		Cleanup();
 		exit(0);
 	}
 };

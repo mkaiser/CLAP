@@ -58,7 +58,12 @@ public:
 #endif
 	{}
 
-	virtual void Init(const uint32_t& devNum, const uint32_t& interruptNum, HasInterrupt* pReg = nullptr)
+	~PCIeUserInterrupt() override
+	{
+		unset();
+	}
+
+	void Init(const uint32_t& devNum, const uint32_t& interruptNum, HasInterrupt* pReg = nullptr) override
 	{
 		if (DEVICE_HANDLE_VALID(m_fd))
 			Unset();
@@ -72,7 +77,7 @@ public:
 		if (!DEVICE_HANDLE_VALID(m_fd))
 		{
 			std::stringstream ss;
-			ss << CLASS_TAG("PCIeUserInterrupt") << "Unable to open device " << m_devName << "; errno: " << errsv;
+			ss << CLASS_TAG_AUTO << "Unable to open device " << m_devName << "; errno: " << errsv;
 			throw UserInterruptException(ss.str());
 		}
 
@@ -83,34 +88,26 @@ public:
 		m_interruptNum = interruptNum;
 	}
 
-	void Unset()
+	void Unset() override
 	{
-		if (!DEVICE_HANDLE_VALID(m_fd)) return;
-
-		CLOSE_DEVICE(m_fd);
-		m_fd = INVALID_HANDLE;
-
-#ifndef _WIN32
-		m_pollFd.fd = -1;
-#endif
-		m_pReg = nullptr;
+		unset();
 	}
 
-	bool IsSet() const
+	bool IsSet() const override
 	{
 		return (DEVICE_HANDLE_VALID(m_fd));
 	}
 
-	bool WaitForInterrupt([[maybe_unused]] const int32_t& timeout = WAIT_INFINITE, [[maybe_unused]] const bool& runCallbacks = true)
+	bool WaitForInterrupt([[maybe_unused]] const int32_t& timeout = WAIT_INFINITE, [[maybe_unused]] const bool& runCallbacks = true) override
 	{
 #ifdef _WIN32
-		CLAP_LOG_ERROR << CLASS_TAG("PCIeUserInterrupt") << " Currently not implemented for Windows" << std::endl;
+		CLAP_CLASS_LOG_ERROR << " Currently not implemented for Windows" << std::endl;
 		return false;
 #else
 		if (!IsSet())
 		{
 			std::stringstream ss("");
-			ss << CLASS_TAG("PCIeUserInterrupt") << "Error: Trying to wait for uninitialized user interrupt";
+			ss << CLASS_TAG_AUTO << "Error: Tried to wait for uninitialized user interrupt";
 			throw UserInterruptException(ss.str());
 		}
 
@@ -130,28 +127,38 @@ public:
 			if (rc < 0)
 			{
 				std::stringstream ss;
-				ss << CLASS_TAG("PCIeUserInterrupt") << m_devName << ", call to pread failed (rc: " << rc << ") errno: " << errsv;
+				ss << CLASS_TAG_AUTO << m_devName << ", call to pread failed (rc: " << rc << ") errno: " << errsv;
 				throw UserInterruptException(ss.str());
 			}
 
-			uint32_t lastIntr = -1;
+			uint32_t lastIntr = UNSET_INTR_MASK;
 			if (m_pReg)
 				lastIntr = m_pReg->GetLastInterrupt();
 
-			if (runCallbacks)
-			{
-				for (auto& callback : m_callbacks)
-					callback(lastIntr);
-			}
+			processCallbacks(runCallbacks, lastIntr);
 
-			CLAP_LOG_DEBUG << CLASS_TAG("PCIeUserInterrupt") << "Interrupt present on " << m_devName << ", events: " << events << ", Interrupt Mask: " << (m_pReg ? std::to_string(lastIntr) : "No Status Register Specified") << std::endl;
+			CLAP_CLASS_LOG_DEBUG << "Interrupt present on " << m_devName << ", events: " << events << ", Interrupt Mask: " << (m_pReg ? std::to_string(lastIntr) : "No Interrupt Status Register Specified") << std::endl;
 			return true;
 		}
 		// else
-		// 	CLAP_LOG_DEBUG << CLASS_TAG("PCIeUserInterrupt") << "No Interrupt present on " << m_devName << std::endl;
+		// 	CLAP_CLASS_LOG_DEBUG << "No Interrupt present on " << m_devName << std::endl;
 
 		return false;
 #endif // _WIN32
+	}
+
+private:
+	void unset()
+	{
+		if (!DEVICE_HANDLE_VALID(m_fd)) return;
+
+		CLOSE_DEVICE(m_fd);
+		m_fd = INVALID_HANDLE;
+
+#ifndef _WIN32
+		m_pollFd.fd = INVALID_HANDLE;
+#endif
+		m_pReg = nullptr;
 	}
 
 private:
@@ -166,7 +173,7 @@ class PCIeBackend : virtual public CLAPBackend
 	DISABLE_COPY_ASSIGN_MOVE(PCIeBackend)
 
 public:
-	PCIeBackend(const uint32_t& deviceNum = 0, const uint32_t& channelNum = 0) :
+	explicit PCIeBackend(const uint32_t& deviceNum = 0, const uint32_t& channelNum = 0) :
 		m_h2cDeviceName("/dev/xdma" + std::to_string(deviceNum) + "_h2c_" + std::to_string(channelNum)),
 		m_c2hDeviceName("/dev/xdma" + std::to_string(deviceNum) + "_c2h_" + std::to_string(channelNum)),
 		m_ctrlDeviceName("/dev/xdma" + std::to_string(deviceNum) + "_control"),
@@ -186,7 +193,7 @@ public:
 		m_valid  = (DEVICE_HANDLE_VALID(m_h2cFd) && DEVICE_HANDLE_VALID(m_c2hFd) && DEVICE_HANDLE_VALID(m_ctrlFd));
 	}
 
-	virtual ~PCIeBackend()
+	~PCIeBackend() override
 	{
 		// Try to lock the read, write and ctrl mutex in order to prevent read, write or ctrl access
 		// while the XDMA object is being destroyed and also to prevent the destruction
@@ -200,28 +207,28 @@ public:
 		CLOSE_DEVICE(m_ctrlFd);
 	}
 
-	uint32_t GetDevNum() const
+	uint32_t GetDevNum() const override
 	{
 		return m_devNum;
 	}
 
-	void Read(const uint64_t& addr, void* pData, const uint64_t& sizeInByte)
+	void Read(const uint64_t& addr, void* pData, const uint64_t& sizeInByte) override
 	{
-		// CLAP_LOG_DEBUG << CLASS_TAG("PCIeBackend") << "addr=0x" << std::hex << addr << " pData=0x" << pData << " sizeInByte=0x" << sizeInByte << std::dec << std::endl;
+		CLAP_RW_LOG
 
 		std::lock_guard<std::mutex> lock(m_readMutex);
 
 		if (!m_valid)
 		{
 			std::stringstream ss;
-			ss << CLASS_TAG("PCIeBackend") << "CLAP Instance is not valid, an error probably occurred during device initialization.";
+			ss << CLASS_TAG_AUTO << "CLAP Instance is not valid, an error probably occurred during device initialization.";
 			throw CLAPException(ss.str());
 		}
 
 		if (!IS_ALIGNED(pData, ALIGNMENT))
 		{
 			std::stringstream ss;
-			ss << CLASS_TAG("PCIeBackend") << "pData is not aligned to " << ALIGNMENT << " bytes.";
+			ss << CLASS_TAG_AUTO << "pData is not aligned to " << ALIGNMENT << " bytes.";
 			throw CLAPException(ss.str());
 		}
 
@@ -242,7 +249,7 @@ public:
 			if (SEEK_INVALID(rc, offset))
 			{
 				std::stringstream ss;
-				ss << CLASS_TAG("PCIeBackend") << m_c2hDeviceName << ", failed to seek to offset 0x" << std::hex << offset << " (rc: 0x" << rc << ")" << std::dec;
+				ss << CLASS_TAG_AUTO << m_c2hDeviceName << ", failed to seek to offset 0x" << std::hex << offset << " (rc: 0x" << rc << ")" << std::dec;
 				throw CLAPException(ss.str());
 			}
 
@@ -250,7 +257,7 @@ public:
 			if (!ReadFile(m_c2hFd, pByteData + count, bytes, &rc, NULL))
 			{
 				std::stringstream ss;
-				ss << CLASS_TAG("PCIeBackend") << m_c2hDeviceName << ", failed to read 0x" << std::hex << bytes << " byte from offset 0x" << offset << " Error: " << GetLastError() << std::dec;
+				ss << CLASS_TAG_AUTO << m_c2hDeviceName << ", failed to read 0x" << std::hex << bytes << " byte from offset 0x" << offset << " Error: " << GetLastError() << std::dec;
 				throw CLAPException(ss.str());
 			}
 #else
@@ -262,7 +269,7 @@ public:
 			if (static_cast<ByteCntType>(rc) != bytes)
 			{
 				std::stringstream ss;
-				ss << CLASS_TAG("PCIeBackend") << m_c2hDeviceName << ", failed to read 0x" << std::hex << bytes << " byte from offset 0x" << offset << " (rc: 0x" << rc << ") errno: " << std::dec << errsv << " (" << strerror(errsv) << ")";
+				ss << CLASS_TAG_AUTO << m_c2hDeviceName << ", failed to read 0x" << std::hex << bytes << " byte from offset 0x" << offset << " (rc: 0x" << rc << ") errno: " << std::dec << errsv << " (" << strerror(errsv) << ")";
 				throw CLAPException(ss.str());
 			}
 
@@ -275,30 +282,30 @@ public:
 		if (count != sizeInByte)
 		{
 			std::stringstream ss;
-			ss << CLASS_TAG("PCIeBackend") << m_c2hDeviceName << ", failed to read 0x" << std::hex << sizeInByte << " byte from offset 0x" << offset << " (read: 0x" << count << " byte)" << std::dec;
+			ss << CLASS_TAG_AUTO << m_c2hDeviceName << ", failed to read 0x" << std::hex << sizeInByte << " byte from offset 0x" << offset << " (read: 0x" << count << " byte)" << std::dec;
 			throw CLAPException(ss.str());
 		}
 
-		logTransferTime(addr, sizeInByte, timer, true);
+		logTransferTime(sizeInByte, timer, true);
 	}
 
-	void Write(const uint64_t& addr, const void* pData, const uint64_t& sizeInByte)
+	void Write(const uint64_t& addr, const void* pData, const uint64_t& sizeInByte) override
 	{
-		// CLAP_LOG_DEBUG << CLASS_TAG("PCIeBackend") << "addr=0x" << std::hex << addr << " pData=0x" << pData << " sizeInByte=0x" << sizeInByte << std::dec << std::endl;
+		CLAP_RW_LOG
 
 		std::lock_guard<std::mutex> lock(m_writeMutex);
 
 		if (!m_valid)
 		{
 			std::stringstream ss;
-			ss << CLASS_TAG("PCIeBackend") << "CLAP Instance is not valid, an error probably occurred during device initialization.";
+			ss << CLASS_TAG_AUTO << "CLAP Instance is not valid, an error probably occurred during device initialization.";
 			throw CLAPException(ss.str());
 		}
 
 		if (!IS_ALIGNED(pData, ALIGNMENT))
 		{
 			std::stringstream ss;
-			ss << CLASS_TAG("PCIeBackend") << "pData is not aligned to " << ALIGNMENT << " bytes.";
+			ss << CLASS_TAG_AUTO << "pData is not aligned to " << ALIGNMENT << " bytes.";
 			throw CLAPException(ss.str());
 		}
 
@@ -319,7 +326,7 @@ public:
 			if (SEEK_INVALID(rc, offset))
 			{
 				std::stringstream ss;
-				ss << CLASS_TAG("PCIeBackend") << m_h2cDeviceName << ", failed to seek to offset 0x" << std::hex << offset << " (rc: 0x" << rc << ")" << std::dec;
+				ss << CLASS_TAG_AUTO << m_h2cDeviceName << ", failed to seek to offset 0x" << std::hex << offset << " (rc: 0x" << rc << ")" << std::dec;
 				throw CLAPException(ss.str());
 			}
 
@@ -327,7 +334,7 @@ public:
 			if (!WriteFile(m_h2cFd, pByteData + count, bytes, &rc, NULL))
 			{
 				std::stringstream ss;
-				ss << CLASS_TAG("PCIeBackend") << m_h2cDeviceName << ", failed to write 0x" << std::hex << bytes << " byte to offset 0x" << offset << " Error: " << GetLastError() << std::dec;
+				ss << CLASS_TAG_AUTO << m_h2cDeviceName << ", failed to write 0x" << std::hex << bytes << " byte to offset 0x" << offset << " Error: " << GetLastError() << std::dec;
 				throw CLAPException(ss.str());
 			}
 #else
@@ -338,7 +345,7 @@ public:
 			if (static_cast<ByteCntType>(rc) != bytes)
 			{
 				std::stringstream ss;
-				ss << CLASS_TAG("PCIeBackend") << m_h2cDeviceName << ", failed to write 0x" << std::hex << bytes << " byte to offset 0x" << offset << " (rc: 0x" << rc << ") errno: " << std::dec << errsv << " (" << strerror(errsv) << ")";
+				ss << CLASS_TAG_AUTO << m_h2cDeviceName << ", failed to write 0x" << std::hex << bytes << " byte to offset 0x" << offset << " (rc: 0x" << rc << ") errno: " << std::dec << errsv << " (" << strerror(errsv) << ")";
 				throw CLAPException(ss.str());
 			}
 
@@ -351,30 +358,30 @@ public:
 		if (count != sizeInByte)
 		{
 			std::stringstream ss;
-			ss << CLASS_TAG("PCIeBackend") << m_h2cDeviceName << ", failed to write 0x" << std::hex << sizeInByte << " byte to offset 0x" << offset << " (wrote: 0x" << count << " byte)" << std::dec;
+			ss << CLASS_TAG_AUTO << m_h2cDeviceName << ", failed to write 0x" << std::hex << sizeInByte << " byte to offset 0x" << offset << " (wrote: 0x" << count << " byte)" << std::dec;
 			throw CLAPException(ss.str());
 		}
 
-		logTransferTime(addr, sizeInByte, timer, false);
+		logTransferTime(sizeInByte, timer, false);
 	}
 
-	void ReadCtrl(const uint64_t& addr, uint64_t& data, const std::size_t& byteCnt)
+	void ReadCtrl(const uint64_t& addr, uint64_t& data, const std::size_t& byteCnt) override
 	{
-		CLAP_LOG_DEBUG << CLASS_TAG("PCIeBackend") << "addr=0x" << std::hex << addr << " data=0x" << &data << std::dec << std::endl;
+		CLAP_CLASS_LOG_DEBUG << "addr=0x" << std::hex << addr << " data=0x" << &data << std::dec << std::endl;
 
 		std::lock_guard<std::mutex> lock(m_ctrlMutex);
 
 		if (!m_valid)
 		{
 			std::stringstream ss;
-			ss << CLASS_TAG("PCIeBackend") << "CLAP Instance is not valid, an error probably occurred during device initialization.";
+			ss << CLASS_TAG_AUTO << "CLAP Instance is not valid, an error probably occurred during device initialization.";
 			throw CLAPException(ss.str());
 		}
 
 		if (byteCnt > 8)
 		{
 			std::stringstream ss;
-			ss << CLASS_TAG("PCIeBackend") << "byteCnt is greater than 8 (64-bit), which is not supported.";
+			ss << CLASS_TAG_AUTO << "byteCnt is greater than 8 (64-bit), which is not supported.";
 			throw CLAPException(ss.str());
 		}
 
@@ -390,7 +397,7 @@ public:
 		if (!ReadFile(m_ctrlFd, &data, bytes, &rc, NULL))
 		{
 			std::stringstream ss;
-			ss << CLASS_TAG("PCIeBackend") << m_ctrlDeviceName << ", failed to read 0x" << std::hex << bytes << " byte from offset 0x" << addr << " Error: " << GetLastError() << std::dec;
+			ss << CLASS_TAG_AUTO << m_ctrlDeviceName << ", failed to read 0x" << std::hex << bytes << " byte from offset 0x" << addr << " Error: " << GetLastError() << std::dec;
 			throw CLAPException(ss.str());
 		}
 #else
@@ -401,12 +408,12 @@ public:
 		if (static_cast<ByteCntType>(rc) != bytes)
 		{
 			std::stringstream ss;
-			ss << CLASS_TAG("PCIeBackend") << m_ctrlDeviceName << ", failed to read 0x" << std::hex << bytes << " byte to offset 0x" << offset << " (rc: 0x" << rc << ") errno: " << std::dec << errsv << " (" << strerror(errsv) << ")";
+			ss << CLASS_TAG_AUTO << m_ctrlDeviceName << ", failed to read 0x" << std::hex << bytes << " byte to offset 0x" << offset << " (rc: 0x" << rc << ") errno: " << std::dec << errsv << " (" << strerror(errsv) << ")";
 			throw CLAPException(ss.str());
 		}
 	}
 
-	UserInterruptPtr MakeUserInterrupt() const
+	UserInterruptPtr MakeUserInterrupt() const override
 	{
 		return std::make_unique<PCIeUserInterrupt>();
 	}

@@ -27,7 +27,9 @@
 #pragma once
 
 ////// TODO:
-// - Maybe change the way IP core objects are created, possible to create from an XDMA object?
+// - Implement read/write only options for registers
+// --------------------------------------------------------------------------------------------
+// - Maybe change the way IP core objects are created, possible to create from a CLAP object?
 // --------------------------------------------------------------------------------------------
 // - Look into 32-bit AXI interfaces, although this is disabled by default it might still be used
 //   - Would require some edits to the memory manager
@@ -40,7 +42,7 @@
 // --------------------------------------------------------------------------------------------
 // - Redesign some of the methods to remove the need for explicit casts
 // --------------------------------------------------------------------------------------------
-// - Replace pointers, e.g., in XDMAManaged with smart pointers
+// - Replace pointers, e.g., in CLAPManaged with smart pointers
 // --------------------------------------------------------------------------------------------
 // - Detect if the control address of an IP Core is within the range of a memory block / other IP Core
 // --------------------------------------------------------------------------------------------
@@ -50,6 +52,7 @@
 // --------------------------------------------------------------------------------------------
 // - Read/Write stream methods are only implemented for XDMA, possible for other backends? -- Move to different location
 // --------------------------------------------------------------------------------------------
+// - Reduce the redundant code in the WaitForInterrupt methods of the UserInterrupt implementations
 ///////////////////////////////////////////////////////////////////////////////////////////////
 
 /////////////////////////
@@ -103,7 +106,7 @@ class CLAPManaged
 	DISABLE_COPY_ASSIGN_MOVE(CLAPManaged)
 
 protected:
-	CLAPManaged(internal::CLAPBasePtr pClap);
+	explicit CLAPManaged(internal::CLAPBasePtr pClap);
 
 	virtual ~CLAPManaged();
 
@@ -122,7 +125,8 @@ protected:
 private:
 	void markCLAPInvalid()
 	{
-		m_pClap = nullptr;
+		if (m_pClap)
+			m_pClap = nullptr;
 	}
 
 	void checkCLAPValid() const
@@ -130,7 +134,7 @@ private:
 		if (m_pClap == nullptr)
 		{
 			std::stringstream ss;
-			ss << CLASS_TAG("CLAPManaged") << "CLAP/CLAPPio instance is not valid or has been destroyed";
+			ss << CLASS_TAG_AUTO << "CLAP/CLAPPio instance is not valid or has been destroyed";
 			throw CLAPException(ss.str());
 		}
 	}
@@ -157,9 +161,8 @@ public:
 	virtual Expected<uint64_t> ReadUIOProperty(const uint64_t& addr, const std::string& propName) const                 = 0;
 	virtual Expected<std::string> ReadUIOStringProperty(const uint64_t& addr, const std::string& propName) const        = 0;
 	virtual Expected<std::vector<uint64_t>> ReadUIOPropertyVec(const uint64_t& addr, const std::string& propName) const = 0;
+	virtual bool CheckUIOPropertyExists(const uint64_t& addr, const std::string& propName) const                        = 0;
 	virtual Expected<int32_t> GetUIOID(const uint64_t& addr) const                                                      = 0;
-
-	virtual void AddPollAddress(const uint64_t& addr) = 0;
 
 	uint32_t GetDevNum() const
 	{
@@ -169,30 +172,40 @@ public:
 protected:
 	CLAPBase(const uint32_t& devNum) :
 		m_devNum(devNum),
-		m_managedObjects()
+		m_managedObjects(),
+		m_mtx()
 	{
 	}
 
 	virtual ~CLAPBase()
 	{
+		std::lock_guard<std::mutex> lock(m_mtx);
 		for (CLAPManaged* pM : m_managedObjects)
-			pM->markCLAPInvalid();
+		{
+			if (pM)
+				pM->markCLAPInvalid();
+		}
 	}
 
 private:
 	void registerObject(CLAPManaged* pObj)
 	{
+		std::lock_guard<std::mutex> lock(m_mtx);
 		m_managedObjects.push_back(pObj);
 	}
 
 	void unregisterObject(CLAPManaged* pObj)
 	{
+		std::lock_guard<std::mutex> lock(m_mtx);
 		m_managedObjects.erase(std::remove(m_managedObjects.begin(), m_managedObjects.end(), pObj), m_managedObjects.end());
 	}
 
 protected:
 	uint32_t m_devNum;
 	std::vector<CLAPManaged*> m_managedObjects;
+
+private:
+	std::mutex m_mtx;
 };
 } // namespace internal
 
@@ -202,8 +215,24 @@ public:
 	enum class MemoryType
 	{
 		DDR,
+		HBM,
 		BRAM
 	};
+
+	std::string GetMemoryTypeName(const MemoryType& type) const
+	{
+		switch (type)
+		{
+			case MemoryType::DDR:
+				return "DDR";
+			case MemoryType::HBM:
+				return "HBM";
+			case MemoryType::BRAM:
+				return "BRAM";
+			default:
+				return "Unknown";
+		}
+	}
 
 	struct MemoryRegion
 	{
@@ -228,6 +257,12 @@ private:
 			m_version   = (reg0x0 >> 0) & 0xF;
 			m_streaming = (reg0x0 >> 15) & 0x1;
 			m_polling   = (reg0x4 >> 26) & 0x1;
+			m_valid     = true;
+		}
+
+		operator bool() const
+		{
+			return m_valid;
 		}
 
 		const bool& IsStreaming() const
@@ -245,31 +280,39 @@ private:
 		}
 
 	private:
+		bool m_valid        = false;
 		uint8_t m_channelID = 0;
 		uint8_t m_version   = 0;
 		bool m_streaming    = false;
 		bool m_polling      = false;
 	};
 
-	CLAP(internal::CLAPBackendPtr pBackend) :
+	explicit CLAP(internal::CLAPBackendPtr pBackend, const bool& disableWarden = false) :
 		CLAPBase(pBackend->GetDevNum()),
 		m_pBackend(std::move(pBackend)),
 		m_memories(),
-		m_mutex()
+		m_rwMtx(),
+		m_pollAddrMtx(),
+		m_memMtx()
 	{
 #ifndef EMBEDDED_XILINX
-		internal::SoloRunWarden::GetInstance();
+		if (!disableWarden)
+			internal::SoloRunWarden::GetInstance();
 #endif
 
 		m_memories.insert(MemoryPair(MemoryType::DDR, internal::MemoryManagerVec()));
+		m_memories.insert(MemoryPair(MemoryType::HBM, internal::MemoryManagerVec()));
 		m_memories.insert(MemoryPair(MemoryType::BRAM, internal::MemoryManagerVec()));
 
 		readInfo();
 
-		CLAP_LOG_VERBOSE << "CLAP instance created" << std::endl;
-		CLAP_LOG_VERBOSE << "Device number: " << m_devNum << std::endl;
-		CLAP_LOG_VERBOSE << "Backend: " << m_pBackend->GetBackendName() << std::endl;
-		CLAP_LOG_VERBOSE << m_info << std::endl;
+		CLAP_CLASS_LOG_VERBOSE << "CLAP instance created" << std::endl;
+		CLAP_CLASS_LOG_VERBOSE << "Device number: " << m_devNum << std::endl;
+		CLAP_CLASS_LOG_VERBOSE << "Backend: " << m_pBackend->GetBackendName() << std::endl;
+
+		if (m_info)
+			CLAP_CLASS_LOG_VERBOSE << std::endl
+								   << m_info << std::endl;
 	}
 
 public:
@@ -278,15 +321,16 @@ public:
 	/// @return A shared pointer to the new CLAP instance
 	/// @param deviceNum Device number of the CLAP device
 	/// @param channelNum Channel number of the CLAP device
+	/// @param disableWarden Disables the SoloRunWarden if set to true
 	template<typename T>
-	static CLAPPtr Create(const uint32_t& deviceNum = 0, const uint32_t& channelNum = 0)
+	static CLAPPtr Create(const uint32_t& deviceNum = 0, const uint32_t& channelNum = 0, const bool& disableWarden = false)
 	{
 		// We have to use the result of new here, because the constructor is private
 		// and can therefore, not be called from make_shared
-		return CLAPPtr(new CLAP(std::make_shared<T>(deviceNum, channelNum)));
+		return CLAPPtr(new CLAP(std::make_shared<T>(deviceNum, channelNum), disableWarden));
 	}
 
-	~CLAP()
+	~CLAP() override
 	{
 	}
 
@@ -295,9 +339,14 @@ public:
 		return m_pBackend->MakeUserInterrupt();
 	}
 
-	void AddPollAddress(const uint64_t& addr)
+	void SetLogByteThreshold(const uint64_t& threshold)
 	{
-		m_pBackend->AddPollAddr(addr);
+		m_pBackend->SetLogByteThreshold(threshold);
+	}
+
+	const uint64_t& GetLogByteThreshold() const
+	{
+		return m_pBackend->GetLogByteThreshold();
 	}
 
 	/// @brief Adds a memory region to the CLAP instance
@@ -306,11 +355,13 @@ public:
 	/// @param size Size of the memory region in bytes
 	void AddMemoryRegion(const MemoryType& type, const uint64_t& baseAddr, const uint64_t& size)
 	{
+		std::lock_guard<std::mutex> lock(m_memMtx);
 		m_memories[type].push_back(std::make_shared<internal::MemoryManager>(baseAddr, size));
 	}
 
 	void AddMemoryRegion(const MemoryRegion& region)
 	{
+		std::lock_guard<std::mutex> lock(m_memMtx);
 		AddMemoryRegion(region.type, region.baseAddress, region.size);
 	}
 
@@ -321,31 +372,19 @@ public:
 	/// @return Allocated memory block
 	Memory AllocMemory(const MemoryType& type, const uint64_t& byteSize, const int32_t& memIdx = -1)
 	{
-		std::lock_guard<std::mutex> lock(m_mutex);
+		return allocMemory<Memory>(type, byteSize, memIdx);
+	}
 
-		if (memIdx == -1)
-		{
-			for (internal::MemoryManagerPtr& mem : m_memories[type])
-			{
-				if (mem->GetAvailableSpace() >= byteSize)
-					return mem->AllocMemory(byteSize);
-			}
-		}
-		else
-		{
-			if (m_memories[type].size() <= static_cast<uint32_t>(memIdx))
-			{
-				std::stringstream ss;
-				ss << CLASS_TAG("CLAP") << "Specified memory region " << std::dec << memIdx << " does not exist.";
-				throw CLAPException(ss.str());
-			}
-
-			return m_memories[type][memIdx]->AllocMemory(byteSize);
-		}
-
-		std::stringstream ss;
-		ss << CLASS_TAG("CLAP") << "No memory region found with enough space left to allocate " << std::dec << byteSize << " byte.";
-		throw CLAPException(ss.str());
+	/// @brief Template version: Allocates a memory block of the specified size and type
+	/// @tparam T Type of the memory object to return, can be Memory, MemoryPtr, or MemoryUPtr
+	/// @param type Type of memory to allocate
+	/// @param byteSize Size of the memory block in bytes
+	/// @param memIdx Index of the memory region to allocate from
+	/// @return Allocated memory object of type T
+	template<typename T>
+	T AllocMemory(const MemoryType& type, const uint64_t& byteSize, const int32_t& memIdx = -1)
+	{
+		return allocMemory<T>(type, byteSize, memIdx);
 	}
 
 	/// @brief Allocates a memory block for n-elements
@@ -359,6 +398,19 @@ public:
 		return AllocMemory(type, elements * sizeOfElement, memIdx);
 	}
 
+	/// @brief Template version: Allocates a memory block for n-elements of type T
+	/// @tparam T Type of the memory object to return, can be Memory, MemoryPtr, or MemoryUPtr
+	/// @param type Type of memory to allocate
+	/// @param elements Number of elements to allocate
+	/// @param sizeOfElement Size of one element in bytes
+	/// @param memIdx Index of the memory region to allocate from
+	/// @return Allocated memory block of type T
+	template<typename T>
+	T AllocMemory(const MemoryType& type, const uint64_t& elements, const std::size_t& sizeOfElement, const int32_t& memIdx = -1)
+	{
+		return AllocMemory<T>(type, elements * sizeOfElement, memIdx);
+	}
+
 	/// @brief Allocates a DDR memory block for n-elements
 	/// @param elements Number of elements to allocate
 	/// @param sizeOfElement Size of one element in bytes
@@ -367,6 +419,40 @@ public:
 	Memory AllocMemoryDDR(const uint64_t& elements, const std::size_t& sizeOfElement, const int32_t& memIdx = -1)
 	{
 		return AllocMemory(MemoryType::DDR, elements, sizeOfElement, memIdx);
+	}
+
+	/// @brief Template version: Allocates a DDR memory block for n-elements of type T
+	/// @tparam T Type of the memory object to return, can be Memory, MemoryPtr, or MemoryUPtr
+	/// @param elements Number of elements to allocate
+	/// @param sizeOfElement Size of one element in bytes
+	/// @param memIdx Index of the memory region to allocate from
+	/// @return Allocated DDR memory block of type T
+	template<typename T>
+	T AllocMemoryDDR(const uint64_t& elements, const std::size_t& sizeOfElement, const int32_t& memIdx = -1)
+	{
+		return AllocMemory<T>(MemoryType::DDR, elements, sizeOfElement, memIdx);
+	}
+
+	/// @brief Allocates a HBM memory block for n-elements
+	/// @param elements Number of elements to allocate
+	/// @param sizeOfElement Size of one element in bytes
+	/// @param memIdx Index of the memory region to allocate from
+	/// @return Allocated HBM memory block
+	Memory AllocMemoryHBM(const uint64_t& elements, const std::size_t& sizeOfElement, const int32_t& memIdx = -1)
+	{
+		return AllocMemory(MemoryType::HBM, elements, sizeOfElement, memIdx);
+	}
+
+	/// @brief Template version: Allocates a HBM memory block for n-elements of type T
+	/// @tparam T Type of the memory object to return, can be Memory, MemoryPtr, or MemoryUPtr
+	/// @param elements Number of elements to allocate
+	/// @param sizeOfElement Size of one element in bytes
+	/// @param memIdx Index of the memory region to allocate from
+	/// @return Allocated HBM memory block of type T
+	template<typename T>
+	T AllocMemoryHBM(const uint64_t& elements, const std::size_t& sizeOfElement, const int32_t& memIdx = -1)
+	{
+		return AllocMemory<T>(MemoryType::HBM, elements, sizeOfElement, memIdx);
 	}
 
 	/// @brief Allocates a BRAM memory block for n-elements
@@ -379,6 +465,18 @@ public:
 		return AllocMemory(MemoryType::BRAM, elements, sizeOfElement, memIdx);
 	}
 
+	/// @brief Template version: Allocates a BRAM memory block for n-elements of type T
+	/// @tparam T Type of the memory object to return, can be Memory, MemoryPtr, or MemoryUPtr
+	/// @param elements Number of elements to allocate
+	/// @param sizeOfElement Size of one element in bytes
+	/// @param memIdx Index of the memory region to allocate from
+	/// @return Allocated BRAM memory block of type T
+	template<typename T>
+	T AllocMemoryBRAM(const uint64_t& elements, const std::size_t& sizeOfElement, const int32_t& memIdx = -1)
+	{
+		return AllocMemory<T>(MemoryType::BRAM, elements, sizeOfElement, memIdx);
+	}
+
 	/// @brief Allocates a DDR memory block of the specified byte size
 	/// @param byteSize Size of the memory block in bytes
 	/// @param memIdx Index of the memory region to allocate from
@@ -386,6 +484,37 @@ public:
 	Memory AllocMemoryDDR(const uint64_t& byteSize, const int32_t& memIdx = -1)
 	{
 		return AllocMemory(MemoryType::DDR, byteSize, memIdx);
+	}
+
+	/// @brief Template version: Allocates a DDR memory block of the specified byte size
+	/// @tparam T Type of the memory object to return, can be Memory, MemoryPtr, or MemoryUPtr
+	/// @param byteSize Size of the memory block in bytes
+	/// @param memIdx Index of the memory region to allocate from
+	/// @return Allocated DDR memory block of type T
+	template<typename T>
+	T AllocMemoryDDR(const uint64_t& byteSize, const int32_t& memIdx = -1)
+	{
+		return AllocMemory<T>(MemoryType::DDR, byteSize, memIdx);
+	}
+
+	/// @brief Allocates a HBM memory block of the specified byte size
+	/// @param byteSize Size of the memory block in bytes
+	/// @param memIdx Index of the memory region to allocate from
+	/// @return Allocated HBM memory block
+	Memory AllocMemoryHBM(const uint64_t& byteSize, const int32_t& memIdx = -1)
+	{
+		return AllocMemory(MemoryType::HBM, byteSize, memIdx);
+	}
+
+	/// @brief Template version: Allocates a HBM memory block of the specified byte size
+	/// @tparam T Type of the memory object to return, can be Memory, MemoryPtr, or MemoryUPtr
+	/// @param byteSize Size of the memory block in bytes
+	/// @param memIdx Index of the memory region to allocate from
+	/// @return Allocated HBM memory block of type T
+	template<typename T>
+	T AllocMemoryHBM(const uint64_t& byteSize, const int32_t& memIdx = -1)
+	{
+		return AllocMemory<T>(MemoryType::HBM, byteSize, memIdx);
 	}
 
 	/// @brief Allocates a BRAM memory block of the specified byte size
@@ -397,10 +526,23 @@ public:
 		return AllocMemory(MemoryType::BRAM, byteSize, memIdx);
 	}
 
+	/// @brief Template version: Allocates a BRAM memory block of the specified byte size
+	/// @tparam T Type of the memory object to return, can be Memory, MemoryPtr, or MemoryUPtr
+	/// @param byteSize Size of the memory block in bytes
+	/// @param memIdx Index of the memory region to allocate from
+	/// @return Allocated BRAM memory block of type T
+	template<typename T>
+	T AllocMemoryBRAM(const uint64_t& byteSize, const int32_t& memIdx = -1)
+	{
+		return AllocMemory<T>(MemoryType::BRAM, byteSize, memIdx);
+	}
+
 	/// @brief Frees the specified memory block
 	/// @param mem Memory block to free
 	void FreeMemory(Memory& mem)
 	{
+		std::lock_guard<std::mutex> lock(m_memMtx);
+
 		for (auto& [type, memories] : m_memories)
 		{
 			for (auto& memManager : memories)
@@ -416,6 +558,8 @@ public:
 	/// @param memIdx Index of the memory region to reset
 	void ResetMemory(const MemoryType& type, const int32_t& memIdx = -1)
 	{
+		std::lock_guard<std::mutex> lock(m_memMtx);
+
 		if (memIdx == -1)
 		{
 			for (auto& memManager : m_memories[type])
@@ -426,7 +570,7 @@ public:
 			if (m_memories[type].size() <= static_cast<uint32_t>(memIdx))
 			{
 				std::stringstream ss;
-				ss << CLASS_TAG("CLAP") << "Specified memory region " << std::dec << memIdx << " does not exist.";
+				ss << CLASS_TAG_AUTO << "Specified memory region " << std::dec << memIdx << " does not exist.";
 				throw CLAPException(ss.str());
 			}
 
@@ -437,10 +581,36 @@ public:
 	/// @brief Resets all memory regions
 	void ResetMemory()
 	{
+		std::lock_guard<std::mutex> lock(m_memMtx);
+
 		for (auto& [type, memories] : m_memories)
 		{
 			for (auto& memManager : memories)
 				memManager->Reset();
+		}
+	}
+
+	/// @brief Sets the alignment of the specified memory region
+	/// @param type Type of memory
+	/// @param alignment Alignment to set, -1 disables custom alignment and uses the default alignment (64 bytes)
+	void SetMemoryAlignment(const MemoryType& type, const int32_t& alignment)
+	{
+		std::lock_guard<std::mutex> lock(m_memMtx);
+
+		for (auto& memManager : m_memories[type])
+			memManager->SetCustomAlignment(alignment);
+	}
+
+	/// @brief Sets the alignment of all memory regions
+	/// @param alignment Alignment to set, -1 disables custom alignment and uses the default alignment (64 bytes)
+	void SetMemoryAlignment(const int32_t& alignment)
+	{
+		std::lock_guard<std::mutex> lock(m_memMtx);
+
+		for (auto& [type, memories] : m_memories)
+		{
+			for (auto& memManager : memories)
+				memManager->SetCustomAlignment(alignment);
 		}
 	}
 
@@ -467,7 +637,7 @@ public:
 		if (size > mem.GetSize())
 		{
 			std::stringstream ss;
-			ss << CLASS_TAG("CLAP") << m_pBackend->GetName(internal::CLAPBackend::TYPE::READ) << ", specified size (0x" << std::hex << size << ") exceeds size of the given memory (0x" << std::hex << mem.GetSize() << ")";
+			ss << CLASS_TAG_AUTO << m_pBackend->GetName(internal::CLAPBackend::TYPE::READ) << ", specified size (0x" << std::hex << size << ") exceeds size of the given memory (0x" << std::hex << mem.GetSize() << ")";
 			throw CLAPException(ss.str());
 		}
 
@@ -486,14 +656,14 @@ public:
 		if (size > mem.GetSize())
 		{
 			std::stringstream ss;
-			ss << CLASS_TAG("CLAP") << m_pBackend->GetName(internal::CLAPBackend::TYPE::READ) << ", specified size (0x" << std::hex << size << ") exceeds size of the given memory (0x" << std::hex << mem.GetSize() << ")";
+			ss << CLASS_TAG_AUTO << m_pBackend->GetName(internal::CLAPBackend::TYPE::READ) << ", specified size (0x" << std::hex << size << ") exceeds size of the given memory (0x" << std::hex << mem.GetSize() << ")";
 			throw CLAPException(ss.str());
 		}
 
 		if (size > (buffer.size() * sizeof(T)))
 		{
 			std::stringstream ss;
-			ss << CLASS_TAG("CLAP") << "Byte size of buffer provided (" << std::dec << buffer.size() * sizeof(T) << ") is smaller than the desired read size (" << size << ")";
+			ss << CLASS_TAG_AUTO << "Byte size of buffer provided (" << std::dec << buffer.size() * sizeof(T) << ") is smaller than the desired read size (" << size << ")";
 			throw CLAPException(ss.str());
 		}
 
@@ -511,7 +681,7 @@ public:
 		if (sizeInByte > (buffer.size() * sizeof(T)))
 		{
 			std::stringstream ss;
-			ss << CLASS_TAG("CLAP") << "Byte size of buffer provided (" << std::dec << buffer.size() * sizeof(T) << ") is smaller than the desired read size (" << sizeInByte << ")";
+			ss << CLASS_TAG_AUTO << "Byte size of buffer provided (" << std::dec << buffer.size() * sizeof(T) << ") is smaller than the desired read size (" << sizeInByte << ")";
 			throw CLAPException(ss.str());
 		}
 
@@ -598,7 +768,7 @@ public:
 	/// @brief Reads a single unsigned byte from the specified address
 	/// @param addr Address to read from
 	/// @return Unsigned byte read from the specified address
-	uint8_t Read8(const uint64_t& addr)
+	uint8_t Read8(const uint64_t& addr) override
 	{
 		return Read<uint8_t>(addr);
 	}
@@ -606,7 +776,7 @@ public:
 	/// @brief Reads a single unsigned word from the specified address
 	/// @param addr Address to read from
 	/// @return Unsigned word read from the specified address
-	uint16_t Read16(const uint64_t& addr)
+	uint16_t Read16(const uint64_t& addr) override
 	{
 		return Read<uint16_t>(addr);
 	}
@@ -614,7 +784,7 @@ public:
 	/// @brief Reads a single unsigned double word from the specified address
 	/// @param addr Address to read from
 	/// @return Unsigned double word read from the specified address
-	uint32_t Read32(const uint64_t& addr)
+	uint32_t Read32(const uint64_t& addr) override
 	{
 		return Read<uint32_t>(addr);
 	}
@@ -622,7 +792,7 @@ public:
 	/// @brief Reads a single unsigned quad word from the specified address
 	/// @param addr Address to read from
 	/// @return Unsigned quad word read from the specified address
-	uint64_t Read64(const uint64_t& addr)
+	uint64_t Read64(const uint64_t& addr) override
 	{
 		return Read<uint64_t>(addr);
 	}
@@ -682,7 +852,7 @@ public:
 		if (size > mem.GetSize())
 		{
 			std::stringstream ss;
-			ss << CLASS_TAG("CLAP") << m_pBackend->GetName(internal::CLAPBackend::TYPE::WRITE) << ", specified size (0x" << std::hex << size << ") exceeds size of the given memory (0x" << std::hex << mem.GetSize() << ")";
+			ss << CLASS_TAG_AUTO << m_pBackend->GetName(internal::CLAPBackend::TYPE::WRITE) << ", specified size (0x" << std::hex << size << ") exceeds size of the given memory (0x" << std::hex << mem.GetSize() << ")";
 			throw CLAPException(ss.str());
 		}
 
@@ -701,18 +871,45 @@ public:
 		if (size > mem.GetSize())
 		{
 			std::stringstream ss;
-			ss << CLASS_TAG("CLAP") << m_pBackend->GetName(internal::CLAPBackend::TYPE::WRITE) << ", specified size (0x" << std::hex << size << ") exceeds size of the given memory (0x" << std::hex << mem.GetSize() << ")";
+			ss << CLASS_TAG_AUTO << m_pBackend->GetName(internal::CLAPBackend::TYPE::WRITE) << ", specified size (0x" << std::hex << size << ") exceeds the size of the given memory (0x" << std::hex << mem.GetSize() << ")";
 			throw CLAPException(ss.str());
 		}
 
 		if (size > (buffer.size() * sizeof(T)))
 		{
 			std::stringstream ss;
-			ss << CLASS_TAG("CLAP") << "Byte size of buffer provided (" << buffer.size() * sizeof(T) << ") is smaller than the desired write size (" << size << ")";
+			ss << CLASS_TAG_AUTO << "Byte size of buffer provided (" << buffer.size() * sizeof(T) << ") is smaller than the desired write size (" << size << ")";
 			throw CLAPException(ss.str());
 		}
 
 		Write(mem, buffer.data(), size);
+	}
+
+	/// @brief Writes data to the specified memory object
+	/// @tparam T Type of the data to write
+	/// @param mem Memory object to write to
+	/// @param memOffset Offset in the memory object to write to
+	/// @param buffer CLAP buffer containing the data to write
+	/// @param sizeInByte Size of the data buffer in bytes
+	template<typename T>
+	void Write(const Memory& mem, const uint64_t& memOffset, const CLAPBuffer<T>& buffer, const uint64_t& sizeInByte = USE_MEMORY_SIZE)
+	{
+		uint64_t size = (sizeInByte == USE_MEMORY_SIZE ? mem.GetSize() : sizeInByte);
+		if (memOffset + size > mem.GetSize())
+		{
+			std::stringstream ss;
+			ss << CLASS_TAG_AUTO << m_pBackend->GetName(internal::CLAPBackend::TYPE::WRITE) << ", specified size (0x" << std::hex << size << ") and offset (0x" << memOffset << ") exceed the size of the given memory (0x" << std::hex << mem.GetSize() << ")";
+			throw CLAPException(ss.str());
+		}
+
+		if (size > (buffer.size() * sizeof(T)))
+		{
+			std::stringstream ss;
+			ss << CLASS_TAG_AUTO << "Byte size of buffer provided (" << buffer.size() * sizeof(T) << ") is smaller than the desired write size (" << size << ")";
+			throw CLAPException(ss.str());
+		}
+
+		Write(mem.GetBaseAddr() + memOffset, buffer, size);
 	}
 
 	/// @brief Writes data to the specified address
@@ -726,7 +923,7 @@ public:
 		if (sizeInByte > (buffer.size() * sizeof(T)))
 		{
 			std::stringstream ss;
-			ss << CLASS_TAG("CLAP") << "Byte size of buffer provided (" << std::dec << buffer.size() * sizeof(T) << ") is smaller than the desired write size (" << sizeInByte << ")";
+			ss << CLASS_TAG_AUTO << "Byte size of buffer provided (" << std::dec << buffer.size() * sizeof(T) << ") is smaller than the desired write size (" << sizeInByte << ")";
 			throw CLAPException(ss.str());
 		}
 
@@ -769,7 +966,7 @@ public:
 	/// @brief Writes a single unsigned byte to the specified address
 	/// @param addr Address to write to
 	/// @param data Unsigned byte to write to the specified address
-	void Write8(const uint64_t& addr, const uint8_t& data)
+	void Write8(const uint64_t& addr, const uint8_t& data) override
 	{
 		Write<uint8_t>(addr, data);
 	}
@@ -777,7 +974,7 @@ public:
 	/// @brief Writes a single unsigned word to the specified address
 	/// @param addr Address to write to
 	/// @param data Unsigned word to write to the specified address
-	void Write16(const uint64_t& addr, const uint16_t& data)
+	void Write16(const uint64_t& addr, const uint16_t& data) override
 	{
 		Write<uint16_t>(addr, data);
 	}
@@ -785,7 +982,7 @@ public:
 	/// @brief Writes a single unsigned double word to the specified address
 	/// @param addr Address to write to
 	/// @param data Unsigned double word to write to the specified address
-	void Write32(const uint64_t& addr, const uint32_t& data)
+	void Write32(const uint64_t& addr, const uint32_t& data) override
 	{
 		Write<uint32_t>(addr, data);
 	}
@@ -793,7 +990,7 @@ public:
 	/// @brief Writes a single unsigned quad word to the specified address
 	/// @param addr Address to write to
 	/// @param data Unsigned quad word to write to the specified address
-	void Write64(const uint64_t& addr, const uint64_t& data)
+	void Write64(const uint64_t& addr, const uint64_t& data) override
 	{
 		Write<uint64_t>(addr, data);
 	}
@@ -834,22 +1031,27 @@ public:
 	///                      UIO Property Methods                            ///
 	////////////////////////////////////////////////////////////////////////////
 
-	Expected<uint64_t> ReadUIOProperty(const uint64_t& addr, const std::string& propName) const
+	Expected<uint64_t> ReadUIOProperty(const uint64_t& addr, const std::string& propName) const override
 	{
 		return m_pBackend->ReadUIOProperty(addr, propName);
 	}
 
-	Expected<std::string> ReadUIOStringProperty(const uint64_t& addr, const std::string& propName) const
+	Expected<std::string> ReadUIOStringProperty(const uint64_t& addr, const std::string& propName) const override
 	{
 		return m_pBackend->ReadUIOStringProperty(addr, propName);
 	}
 
-	Expected<std::vector<uint64_t>> ReadUIOPropertyVec(const uint64_t& addr, const std::string& propName) const
+	Expected<std::vector<uint64_t>> ReadUIOPropertyVec(const uint64_t& addr, const std::string& propName) const override
 	{
 		return m_pBackend->ReadUIOPropertyVec(addr, propName);
 	}
 
-	Expected<int32_t> GetUIOID(const uint64_t& addr) const
+	bool CheckUIOPropertyExists(const uint64_t& addr, const std::string& propName) const override
+	{
+		return m_pBackend->CheckUIOPropertyExists(addr, propName);
+	}
+
+	Expected<int32_t> GetUIOID(const uint64_t& addr) const override
 	{
 		return m_pBackend->GetUIOID(addr);
 	}
@@ -947,12 +1149,50 @@ public:
 
 private:
 	template<typename T>
+	T allocMemory(const MemoryType& type, const uint64_t& byteSize, const int32_t& memIdx = -1)
+	{
+		CLAP_CLASS_LOG_DEBUG << "Waiting for memory allocation mutex" << std::endl;
+		std::lock_guard<std::mutex> lock(m_memMtx);
+		CLAP_CLASS_LOG_DEBUG << "Got Mutex - Allocating " << byteSize << " bytes of memory" << std::endl;
+
+		if (memIdx == -1)
+		{
+			CLAP_CLASS_LOG_DEBUG << "Allocating memory from all available regions of type " << GetMemoryTypeName(type) << std::endl;
+			for (internal::MemoryManagerPtr& mem : m_memories[type])
+			{
+				if (mem->GetAvailableSpace() >= byteSize)
+				{
+					CLAP_CLASS_LOG_DEBUG << "Found memory region with enough space: (0x" << std::hex << mem->GetAvailableSpace() << std::dec << " bytes available)" << std::endl;
+					return mem->AllocMemory<T>(byteSize);
+				}
+			}
+		}
+		else
+		{
+			CLAP_CLASS_LOG_DEBUG << "Allocating memory from region with index " << memIdx << " of type " << GetMemoryTypeName(type) << std::endl;
+			if (m_memories[type].size() <= static_cast<uint32_t>(memIdx))
+			{
+				std::stringstream ss;
+				ss << CLASS_TAG_AUTO << "Specified memory region " << std::dec << memIdx << " does not exist.";
+				throw CLAPException(ss.str());
+			}
+
+			CLAP_CLASS_LOG_DEBUG << "Found memory region with enough space: (0x" << std::hex << m_memories[type][memIdx]->GetAvailableSpace() << std::dec << " bytes available)" << std::endl;
+			return m_memories[type][memIdx]->AllocMemory<T>(byteSize);
+		}
+
+		std::stringstream ss;
+		ss << CLASS_TAG_AUTO << "No memory region found with enough space left to allocate 0x" << std::hex << byteSize << " byte." << std::dec;
+		throw CLAPException(ss.str());
+	}
+
+	template<typename T>
 	T read(const Memory& mem)
 	{
 		if (sizeof(T) > mem.GetSize())
 		{
 			std::stringstream ss;
-			ss << CLASS_TAG("CLAP") << "Size of provided memory (" << std::dec << mem.GetSize() << ") is smaller than the desired read size (" << sizeof(T) << ")";
+			ss << CLASS_TAG_AUTO << "Size of provided memory (" << std::dec << mem.GetSize() << ") is smaller than the desired read size (" << sizeof(T) << ")";
 			throw CLAPException(ss.str());
 		}
 
@@ -965,7 +1205,7 @@ private:
 		if (sizeof(T) > mem.GetSize())
 		{
 			std::stringstream ss;
-			ss << CLASS_TAG("CLAP") << "Size of provided memory (" << std::dec << mem.GetSize() << ") is smaller than the desired write size (" << sizeof(T) << ")";
+			ss << CLASS_TAG_AUTO << "Size of provided memory (" << std::dec << mem.GetSize() << ") is smaller than the desired write size (" << sizeof(T) << ")";
 			throw CLAPException(ss.str());
 		}
 
@@ -977,14 +1217,14 @@ private:
 		if (!m_info.IsStreaming())
 		{
 			std::stringstream ss;
-			ss << CLASS_TAG("CLAP") << "The XDMA endpoint is not in streaming mode";
+			ss << CLASS_TAG_AUTO << "The XDMA endpoint is not in streaming mode";
 			throw CLAPException(ss.str());
 		}
 
 		if (m_readFuture.valid())
 		{
 			std::stringstream ss;
-			ss << CLASS_TAG("CLAP") << "Read stream is already running";
+			ss << CLASS_TAG_AUTO << "Read stream is already running";
 			throw CLAPException(ss.str());
 		}
 
@@ -996,14 +1236,14 @@ private:
 		if (!m_info.IsStreaming())
 		{
 			std::stringstream ss;
-			ss << CLASS_TAG("CLAP") << "The XDMA endpoint is not in streaming mode";
+			ss << CLASS_TAG_AUTO << "The XDMA endpoint is not in streaming mode";
 			throw CLAPException(ss.str());
 		}
 
 		if (m_writeFuture.valid())
 		{
 			std::stringstream ss;
-			ss << CLASS_TAG("CLAP") << "Write stream is already running";
+			ss << CLASS_TAG_AUTO << "Write stream is already running";
 			throw CLAPException(ss.str());
 		}
 
@@ -1016,7 +1256,7 @@ private:
 		if (size % internal::XDMA_AXI_DATA_WIDTH != 0)
 		{
 			std::stringstream ss;
-			ss << CLASS_TAG("CLAP") << "Size (" << size << ") is not a multiple of the XDMA AXI data width (" << internal::XDMA_AXI_DATA_WIDTH << ").";
+			ss << CLASS_TAG_AUTO << "Size (" << size << ") is not a multiple of the XDMA AXI data width (" << internal::XDMA_AXI_DATA_WIDTH << ").";
 			throw CLAPException(ss.str());
 		}
 
@@ -1039,7 +1279,7 @@ private:
 		if (size % internal::XDMA_AXI_DATA_WIDTH != 0)
 		{
 			std::stringstream ss;
-			ss << CLASS_TAG("CLAP") << "Size (" << size << ") is not a multiple of the XDMA AXI data width (" << internal::XDMA_AXI_DATA_WIDTH << ").";
+			ss << CLASS_TAG_AUTO << "Size (" << size << ") is not a multiple of the XDMA AXI data width (" << internal::XDMA_AXI_DATA_WIDTH << ").";
 			throw CLAPException(ss.str());
 		}
 
@@ -1088,9 +1328,15 @@ private:
 
 	void readInfo()
 	{
-		uint32_t reg0 = readCtrl32(internal::XDMA_CTRL_BASE + m_devNum * internal::XDMA_CTRL_SIZE + 0x0);
-		uint32_t reg4 = readCtrl32(internal::XDMA_CTRL_BASE + m_devNum * internal::XDMA_CTRL_SIZE + 0x4);
-		m_info        = XDMAInfo(reg0, reg4);
+		try
+		{
+			uint32_t reg0 = readCtrl32(internal::XDMA_CTRL_BASE + m_devNum * internal::XDMA_CTRL_SIZE + 0x0);
+			uint32_t reg4 = readCtrl32(internal::XDMA_CTRL_BASE + m_devNum * internal::XDMA_CTRL_SIZE + 0x4);
+			m_info        = XDMAInfo(reg0, reg4);
+		}
+		catch ([[maybe_unused]] const CLAPException& e)
+		{
+		}
 	}
 	// --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
@@ -1104,7 +1350,9 @@ private:
 
 	XDMAInfo m_info = {};
 
-	std::mutex m_mutex;
+	std::mutex m_rwMtx;
+	std::mutex m_pollAddrMtx;
+	std::mutex m_memMtx;
 };
 
 #ifndef _WIN32
@@ -1118,7 +1366,7 @@ public:
 		m_pioDeviceName("/dev/xdma" + std::to_string(deviceNum) + "_user"),
 		m_pioSize(pioSize),
 		m_pioOffset(pioOffset),
-		m_mutex()
+		m_rwMtx()
 	{
 		m_fd        = open(m_pioDeviceName.c_str(), O_RDWR | O_NONBLOCK);
 		int32_t err = errno;
@@ -1126,7 +1374,7 @@ public:
 		if (m_fd < 0)
 		{
 			std::stringstream ss;
-			ss << CLASS_TAG("") << "Unable to open device " << m_pioDeviceName << "; errno: " << err;
+			ss << CLASS_TAG_AUTO << "Unable to open device " << m_pioDeviceName << "; errno: " << err;
 			throw CLAPException(ss.str());
 		}
 
@@ -1137,7 +1385,7 @@ public:
 		if (m_pMapBase == MAP_FAILED)
 		{
 			std::stringstream ss;
-			ss << CLASS_TAG("XDMAPio") << "Failed to map memory into userspace, errno: " << err;
+			ss << CLASS_TAG_AUTO << "Failed to map memory into userspace, errno: " << err;
 			throw CLAPException(ss.str());
 		}
 #endif
@@ -1147,9 +1395,9 @@ public:
 
 	DISABLE_COPY_ASSIGN_MOVE(XDMAPio)
 
-	~XDMAPio()
+	~XDMAPio() override
 	{
-		std::lock_guard<std::mutex> lock(m_mutex);
+		std::lock_guard<std::mutex> lock(m_rwMtx);
 
 #ifndef EMBEDDED_XILINX
 		munmap(m_pMapBase, m_pioSize);
@@ -1157,42 +1405,42 @@ public:
 		close(m_fd);
 	}
 
-	uint8_t Read8(const uint64_t& addr)
+	uint8_t Read8(const uint64_t& addr) override
 	{
 		return read<uint8_t>(addr);
 	}
 
-	uint16_t Read16(const uint64_t& addr)
+	uint16_t Read16(const uint64_t& addr) override
 	{
 		return read<uint16_t>(addr);
 	}
 
-	uint32_t Read32(const uint64_t& addr)
+	uint32_t Read32(const uint64_t& addr) override
 	{
 		return read<uint32_t>(addr);
 	}
 
-	uint64_t Read64(const uint64_t& addr)
+	uint64_t Read64(const uint64_t& addr) override
 	{
 		return read<uint64_t>(addr);
 	}
 
-	void Write8(const uint64_t& addr, const uint8_t& data)
+	void Write8(const uint64_t& addr, const uint8_t& data) override
 	{
 		write<uint8_t>(addr, data);
 	}
 
-	void Write16(const uint64_t& addr, const uint16_t& data)
+	void Write16(const uint64_t& addr, const uint16_t& data) override
 	{
 		write<uint16_t>(addr, data);
 	}
 
-	void Write32(const uint64_t& addr, const uint32_t& data)
+	void Write32(const uint64_t& addr, const uint32_t& data) override
 	{
 		write<uint32_t>(addr, data);
 	}
 
-	void Write64(const uint64_t& addr, const uint64_t& data)
+	void Write64(const uint64_t& addr, const uint64_t& data) override
 	{
 		write<uint64_t>(addr, data);
 	}
@@ -1201,12 +1449,12 @@ private:
 	template<typename T>
 	T read(const uint64_t& addr)
 	{
-		std::lock_guard<std::mutex> lock(m_mutex);
+		std::lock_guard<std::mutex> lock(m_rwMtx);
 
 		if (!m_valid)
 		{
 			std::stringstream ss;
-			ss << CLASS_TAG("XDMAPio") << "XDMAPio Instance is not valid, an error probably occurred during device initialization.";
+			ss << CLASS_TAG_AUTO << "XDMAPio Instance is not valid, an error probably occurred during device initialization.";
 			throw CLAPException(ss.str());
 		}
 
@@ -1214,14 +1462,14 @@ private:
 		if (size > MAX_PIO_ACCESS_SIZE)
 		{
 			std::stringstream ss;
-			ss << CLASS_TAG("XDMAPio") << "Type size (" << std::dec << size << " byte) exceeds maximal allowed Pio size (" << MAX_PIO_ACCESS_SIZE << " byte)";
+			ss << CLASS_TAG_AUTO << "Type size (" << std::dec << size << " byte) exceeds maximal allowed Pio size (" << MAX_PIO_ACCESS_SIZE << " byte)";
 			throw CLAPException(ss.str());
 		}
 
 		if (addr >= m_pioSize + m_pioOffset)
 		{
 			std::stringstream ss;
-			ss << CLASS_TAG("XDMAPio") << "Address: (0x" << std::hex << addr << ") exceeds Pio address range (0x" << m_pioOffset << "-0x" << m_pioSize + m_pioOffset << ")";
+			ss << CLASS_TAG_AUTO << "Address: (0x" << std::hex << addr << ") exceeds Pio address range (0x" << m_pioOffset << "-0x" << m_pioSize + m_pioOffset << ")";
 			throw CLAPException(ss.str());
 		}
 
@@ -1233,12 +1481,12 @@ private:
 	template<typename T>
 	void write(const uint64_t& addr, const T& data)
 	{
-		std::lock_guard<std::mutex> lock(m_mutex);
+		std::lock_guard<std::mutex> lock(m_rwMtx);
 
 		if (!m_valid)
 		{
 			std::stringstream ss;
-			ss << CLASS_TAG("XDMAPio") << "XDMAPio Instance is not valid, an error probably occurred during device initialization.";
+			ss << CLASS_TAG_AUTO << "XDMAPio Instance is not valid, an error probably occurred during device initialization.";
 			throw CLAPException(ss.str());
 		}
 
@@ -1246,14 +1494,14 @@ private:
 		if (size > MAX_PIO_ACCESS_SIZE)
 		{
 			std::stringstream ss;
-			ss << CLASS_TAG("XDMAPio") << "Type size (" << std::dec << size << " byte) exceeds maximal allowed Pio size (" << MAX_PIO_ACCESS_SIZE << " byte)";
+			ss << CLASS_TAG_AUTO << "Type size (" << std::dec << size << " byte) exceeds maximal allowed Pio size (" << MAX_PIO_ACCESS_SIZE << " byte)";
 			throw CLAPException(ss.str());
 		}
 
 		if (addr >= m_pioSize + m_pioOffset)
 		{
 			std::stringstream ss;
-			ss << CLASS_TAG("XDMAPio") << "Address (0x" << std::hex << addr << ") exceeds Pio address range (0x" << m_pioOffset << "-0x" << m_pioSize + m_pioOffset << ")";
+			ss << CLASS_TAG_AUTO << "Address (0x" << std::hex << addr << ") exceeds Pio address range (0x" << m_pioOffset << "-0x" << m_pioSize + m_pioOffset << ")";
 			throw CLAPException(ss.str());
 		}
 
@@ -1265,12 +1513,12 @@ private:
 	std::string m_pioDeviceName;
 	std::size_t m_pioSize;
 	std::size_t m_pioOffset;
-	int32_t m_fd     = -1;
+	int32_t m_fd     = INVALID_HANDLE;
 	void* m_pMapBase = nullptr;
 	bool m_valid     = false;
-	std::mutex m_mutex;
+	std::mutex m_rwMtx;
 
-	static const std::size_t MAX_PIO_ACCESS_SIZE = sizeof(uint64_t);
+	static inline const std::size_t MAX_PIO_ACCESS_SIZE = sizeof(uint64_t);
 };
 #endif // XDMAPio
 
@@ -1289,5 +1537,12 @@ inline CLAPManaged::~CLAPManaged()
 		m_pClap->unregisterObject(this);
 }
 } // namespace internal
+
+inline void Cleanup()
+{
+#ifndef EMBEDDED_XILINX
+	internal::SoloRunWarden::Cleanup();
+#endif
+}
 
 } // namespace clap

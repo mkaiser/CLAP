@@ -33,7 +33,6 @@
 #include "internal/WatchDog.hpp"
 
 #include <cstdint>
-#include <functional>
 #include <string>
 
 namespace clap
@@ -87,13 +86,12 @@ public:
 	};
 
 public:
-	HLSCore(const CLAPPtr& pClap, const uint64_t& ctrlOffset, const std::string& name) :
-		RegisterControlBase(pClap, ctrlOffset),
+	HLSCore(const CLAPPtr& pClap, const uint64_t& ctrlOffset, const std::string& name = "") :
+		RegisterControlBase(pClap, ctrlOffset, name),
 		m_apCtrl(),
 		m_intrCtrl(),
 		m_intrStat(),
-		m_watchDog(name, pClap->MakeUserInterrupt()),
-		m_name(name)
+		m_watchDog(name, pClap->MakeUserInterrupt())
 	{
 		registerReg<uint8_t>(m_apCtrl, ADDR_AP_CTRL);
 		registerReg<uint8_t>(m_intrCtrl, ADDR_IER);
@@ -106,22 +104,41 @@ public:
 
 	bool Start()
 	{
-		m_apCtrl.Reset();
+		if (m_apCtrl.IsRunning())
+		{
+			CLAP_IP_CORE_LOG_ERROR << "Tried to start HLS core at: 0x" << std::hex << m_ctrlOffset << " which is still running, stopping startup ..." << std::endl;
+			return false;
+		}
+
+		m_apCtrl.Prestart();
 
 		if (!m_watchDog.Start())
 		{
-			CLAP_LOG_ERROR << CLASS_TAG("HLSCore") << "Trying to start HLS core at: 0x" << std::hex << m_ctrlOffset << " which is still running, stopping startup ..." << std::endl;
+			CLAP_IP_CORE_LOG_ERROR << "Tried to start HLS core at: 0x" << std::hex << m_ctrlOffset << " which is still running, stopping startup ..." << std::endl;
 			return false;
 		}
 
 		if (!m_apCtrl.Start())
 		{
-			CLAP_LOG_ERROR << CLASS_TAG("HLSCore") << "Trying to start HLS core at: 0x" << std::hex << m_ctrlOffset << " which is currently not idle, stopping startup ..." << std::endl;
+			CLAP_IP_CORE_LOG_ERROR << "Tried to start HLS core at: 0x" << std::hex << m_ctrlOffset << " which is currently not idle, stopping startup ..." << std::endl;
 			m_watchDog.Stop();
 			return false;
 		}
 
 		return true;
+	}
+
+	void Stop()
+	{
+		m_watchDog.Stop();
+		m_apCtrl.Reset();
+	}
+
+	void Reset()
+	{
+		Stop();
+		m_intrCtrl.Reset();
+		m_intrStat.Reset();
 	}
 
 	bool WaitForFinish(const int32_t& timeoutMS = WAIT_INFINITE)
@@ -142,15 +159,15 @@ public:
 	{
 		uint32_t intrID = eventNo;
 
-		if (eventNo == USE_AUTO_DETECT && m_detectedInterruptID == -1)
+		if (eventNo == USE_AUTO_DETECT && m_detectedInterruptID == INTR_UNDEFINED)
 			AutoDetectInterruptID();
 
-		if (m_detectedInterruptID != -1)
+		if (m_detectedInterruptID != INTR_UNDEFINED)
 			intrID = static_cast<uint32_t>(m_detectedInterruptID);
 
-		if (intrID == internal::MINUS_ONE)
+		if (intrID == USE_AUTO_DETECT)
 		{
-			CLAP_LOG_ERROR << CLASS_TAG("HLSCore") << "Interrupt ID was not automatically detected and no interrupt ID specified - Unable to setup interrupts for HLS Core: \"" << m_name << "\" at: 0x" << std::hex << m_ctrlOffset << std::dec << std::endl;
+			CLAP_IP_CORE_LOG_ERROR << "Interrupt ID was not automatically detected and no interrupt ID specified - Unable to setup interrupts for HLS Core: \"" << m_name << "\" at: 0x" << std::hex << m_ctrlOffset << std::dec << std::endl;
 			return;
 		}
 
@@ -236,7 +253,7 @@ public:
 
 	////////////////////////////////////////
 
-	void RegisterInterruptCallback(const std::function<void(uint32_t)>& callback)
+	void RegisterInterruptCallback(const IntrCallback& callback)
 	{
 		m_watchDog.RegisterInterruptCallback(callback);
 	}
@@ -267,6 +284,7 @@ private:
 		{
 			RegisterElement<bool>(&m_ap_done, "ap_done", 0);
 			RegisterElement<bool>(&m_ap_ready, "ap_ready", 1);
+			reset();
 		}
 
 		void EnableInterrupts(const APInterrupts& intr = AP_INTR_ALL)
@@ -284,6 +302,11 @@ private:
 			return (m_ap_done || m_ap_ready);
 		}
 
+		void Reset()
+		{
+			reset();
+		}
+
 	private:
 		void setInterrupts(bool enable, const APInterrupts& intr)
 		{
@@ -292,6 +315,13 @@ private:
 			if (intr & AP_INTR_READY)
 				m_ap_ready = enable;
 
+			Update(internal::Direction::WRITE);
+		}
+
+		void reset()
+		{
+			m_ap_done  = false;
+			m_ap_ready = false;
 			Update(internal::Direction::WRITE);
 		}
 
@@ -312,24 +342,32 @@ private:
 			RegisterElement<bool>(&m_ap_ready, "ap_ready", 1);
 
 			// Do an initial clear to discard old interrupts
-			ClearInterrupts();
-			m_lastInterrupt = 0;
+			reset();
 		}
 
-		void ClearInterrupts()
+		void ClearInterrupts() override
 		{
-			m_lastInterrupt = GetInterrupts();
-			ResetInterrupts(AP_INTR_ALL);
+			clearInterrupts();
 		}
 
-		uint32_t GetInterrupts()
+		uint32_t GetInterrupts() override
 		{
-			Update();
-			uint32_t intr = 0;
-			intr |= m_ap_done << (AP_INTR_DONE >> 1);
-			intr |= m_ap_ready << (AP_INTR_READY >> 1);
+			return getInterrupts();
+		}
 
-			return intr;
+		bool HasDoneIntr() const override
+		{
+			return m_ap_done;
+		}
+
+		void Reset() override
+		{
+			reset();
+		}
+
+		void ResetStates() override
+		{
+			resetStates();
 		}
 
 		void ResetInterrupts(const APInterrupts& intr)
@@ -343,6 +381,36 @@ private:
 		}
 
 	private:
+		uint32_t getInterrupts()
+		{
+			Update();
+			uint32_t intr = 0;
+			intr |= m_ap_done << (AP_INTR_DONE >> 1);
+			intr |= m_ap_ready << (AP_INTR_READY >> 1);
+
+			return intr;
+		}
+
+		void clearInterrupts()
+		{
+			m_lastInterrupt = getInterrupts();
+			ResetInterrupts(static_cast<APInterrupts>(m_lastInterrupt));
+		}
+
+		void resetStates()
+		{
+			m_lastInterrupt = 0;
+			m_ap_done       = false;
+			m_ap_ready      = false;
+		}
+
+		void reset()
+		{
+			clearInterrupts();
+			resetStates();
+		}
+
+	private:
 		bool m_ap_done;
 		bool m_ap_ready;
 	};
@@ -352,6 +420,5 @@ private:
 	InterruptEnableRegister m_intrCtrl;
 	InterruptStatusRegister m_intrStat;
 	internal::WatchDog m_watchDog;
-	std::string m_name;
 };
 } // namespace clap

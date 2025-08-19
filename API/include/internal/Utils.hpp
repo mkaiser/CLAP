@@ -26,19 +26,65 @@
 
 #pragma once
 
+#include <chrono>
 #include <cmath>
+#include <cxxabi.h>
 #include <exception>
+#include <iomanip>
 #include <sstream>
+#include <thread>
+#include <vector>
+
+#ifdef EMBEDDED_XILINX
+namespace
+{
+#ifndef CLAP_SKIP_SLEEP_H_INC
+#include <sleep.h>
+#endif
+
+void xSleep(const std::chrono::seconds &s)
+{
+	sleep(s.count());
+}
+
+void xUSleep(const std::chrono::microseconds &us)
+{
+	usleep(us.count());
+}
+} // namespace
+#endif
 
 #ifndef CLASS_TAG
 #define CLASS_TAG(_C_) "[" << _C_ << "::" << __func__ << "] "
 #endif
 
+#ifndef CLASS_TAG_AUTO
+#define CLASS_TAG_AUTO "[" << clap::utils::ClassName(*this) << "::" << __func__ << "] "
+#endif
+
+#ifndef CLASS_TAG_AUTO_WITH_NAME
+#define CLASS_TAG_AUTO_WITH_NAME(_N_) "[" << clap::utils::ClassName(*this) << "::" << _N_ << "::" << __func__ << "] "
+#endif
+
+#ifndef FUNCTION_TAG
+#define FUNCTION_TAG "[" << __func__ << "] "
+#endif
+
+#ifndef BUILD_EXCEPTION
+#define BUILD_EXCEPTION(__EXPT__, __MSG__) \
+	{                                      \
+		std::stringstream ss;              \
+		ss << CLASS_TAG_AUTO << __MSG__;   \
+		throw __EXPT__(ss.str());          \
+	}
+#endif
+
 #ifndef DISABLE_COPY_ASSIGN_MOVE
-#define DISABLE_COPY_ASSIGN_MOVE(_C_)                                          \
-	_C_(_C_ const &)            = delete; /* disable copy constructor */       \
-	_C_ &operator=(_C_ const &) = delete; /* disable assignment constructor */ \
-	_C_(_C_ &&)                 = delete;
+#define DISABLE_COPY_ASSIGN_MOVE(_C_)                                               \
+	_C_(const _C_ &)            = delete; /* disable copy constructor */            \
+	_C_ &operator=(const _C_ &) = delete; /* disable copy assignment constructor */ \
+	_C_(_C_ &&)                 = delete; /* disable move constructor*/             \
+	_C_ &operator=(_C_ &&)      = delete; /* disable move assignment constructor*/
 #endif
 
 #ifndef DEFINE_EXCEPTION
@@ -80,20 +126,20 @@ namespace utils
 template<typename T>
 class ReverseRange
 {
-	T &x;
+	T &m_x;
 
 public:
-	ReverseRange(T &x) :
-		x(x) {}
+	explicit ReverseRange(T &x) :
+		m_x(x) {}
 
-	auto begin() const -> decltype(this->x.rbegin())
+	auto begin() const -> decltype(this->m_x.rbegin())
 	{
-		return x.rbegin();
+		return m_x.rbegin();
 	}
 
-	auto end() const -> decltype(this->x.rend())
+	auto end() const -> decltype(this->m_x.rend())
 	{
-		return x.rend();
+		return m_x.rend();
 	}
 };
 
@@ -107,7 +153,7 @@ static ReverseRange<T> ReverseIterate(T &x)
 /// -------------------------------------------------------------------- ///
 
 template<typename T>
-static inline std::string ToStringWithPrecision(const T val, const uint32_t &n = 6)
+inline std::string ToStringWithPrecision(const T val, const uint32_t &n = 6)
 {
 	std::ostringstream out;
 	out.precision(n);
@@ -115,7 +161,7 @@ static inline std::string ToStringWithPrecision(const T val, const uint32_t &n =
 	return out.str();
 }
 
-static inline uint32_t CalcOrder(double val)
+inline uint32_t CalcOrder(double val)
 {
 	uint32_t cnt = 0;
 
@@ -128,7 +174,7 @@ static inline uint32_t CalcOrder(double val)
 	return cnt;
 }
 
-static inline std::string GetPrefix(const uint32_t &order)
+inline std::string GetPrefix(const uint32_t &order)
 {
 	switch (order)
 	{
@@ -156,7 +202,7 @@ static inline std::string GetPrefix(const uint32_t &order)
 	return "UNKNOWN ORDER: " + std::to_string(order);
 }
 
-static inline std::string SpeedWidthSuffix(double val)
+inline std::string SpeedWidthSuffix(double val)
 {
 	std::string str = "";
 	uint32_t order  = CalcOrder(val);
@@ -169,7 +215,7 @@ static inline std::string SpeedWidthSuffix(double val)
 	return str;
 }
 
-static inline std::string SizeWithSuffix(double val)
+inline std::string SizeWithSuffix(double val)
 {
 	std::string str = "";
 	uint32_t order  = CalcOrder(val);
@@ -181,21 +227,104 @@ static inline std::string SizeWithSuffix(double val)
 	return str;
 }
 
-static inline std::string SizeWithSuffix(const uint64_t &val)
+inline std::string SizeWithSuffix(const uint64_t &val)
 {
 	return SizeWithSuffix(static_cast<double>(val));
 }
 
-static inline std::string SizeWithSuffix(const int64_t &val)
+inline std::string SizeWithSuffix(const int64_t &val)
 {
 	return SizeWithSuffix(static_cast<double>(val));
 }
 
-static inline std::string Hex2Str(const uint64_t &val)
+inline std::string Hex2Str(const uint64_t &val)
 {
 	std::stringstream ss;
 	ss << std::hex << val;
 	return ss.str();
+}
+
+inline std::vector<std::string> SplitString(const std::string &s, const char &delimiter = ' ')
+{
+	std::vector<std::string> split;
+	std::string item;
+	std::istringstream stream(s);
+
+	while (std::getline(stream, item, delimiter))
+		split.push_back(item);
+
+	return split;
+}
+
+template<typename T>
+inline std::string ClassName(T &ref)
+{
+	int status;
+	char *pName = abi::__cxa_demangle(typeid(ref).name(), NULL, NULL, &status);
+	std::string name(pName);
+	free(pName);
+
+	// Remove potential namespace prefix
+	name = SplitString(name, ':').back();
+
+	return name;
+}
+
+inline void Sleep(const std::chrono::seconds &s)
+{
+#ifdef EMBEDDED_XILINX
+	xSleep(s);
+#else
+	std::this_thread::sleep_for(s);
+#endif
+}
+
+inline void SleepMS(const std::chrono::milliseconds &ms)
+{
+#ifdef EMBEDDED_XILINX
+	xUSleep(std::chrono::duration_cast<std::chrono::microseconds>(ms));
+#else
+	std::this_thread::sleep_for(ms);
+#endif
+}
+
+inline void SleepUS(const std::chrono::microseconds &us)
+{
+#ifdef EMBEDDED_XILINX
+	xUSleep(us);
+#else
+	std::this_thread::sleep_for(us);
+#endif
+}
+
+inline void Sleep(const uint32_t &s)
+{
+	Sleep(std::chrono::seconds(s));
+}
+
+inline void SleepMS(const uint32_t &ms)
+{
+	SleepMS(std::chrono::milliseconds(ms));
+}
+
+inline void SleepUS(const uint32_t &us)
+{
+	SleepUS(std::chrono::microseconds(us));
+}
+
+inline std::string GetCurrentTime()
+{
+	auto now       = std::chrono::system_clock::now();
+	auto in_time_t = std::chrono::system_clock::to_time_t(now);
+	std::tm buf;
+#ifdef _WIN32
+	localtime_s(&buf, &in_time_t);
+#else
+	localtime_r(&in_time_t, &buf);
+#endif
+	std::ostringstream oss;
+	oss << std::put_time(&buf, "%Y-%m-%d %H:%M:%S");
+	return oss.str();
 }
 
 } // namespace utils

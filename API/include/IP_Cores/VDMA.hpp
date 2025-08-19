@@ -74,8 +74,8 @@ public:
 	};
 
 public:
-	VDMA(const CLAPPtr& pClap, const uint64_t& ctrlOffset) :
-		RegisterControlBase(pClap, ctrlOffset),
+	VDMA(const CLAPPtr& pClap, const uint64_t& ctrlOffset, const std::string& name = "") :
+		RegisterControlBase(pClap, ctrlOffset, name),
 		m_watchDogMM2S("VDMA_MM2S", pClap->MakeUserInterrupt()),
 		m_watchDogS2MM("VDMA_S2MM", pClap->MakeUserInterrupt())
 	{
@@ -88,26 +88,6 @@ public:
 		registerReg<uint32_t>(m_s2mmIrqMask, S2MM_VDMA_IRQ_MASK);
 		registerReg<uint32_t>(m_mm2sFDelyStrideReg, MM2S_FRMDLY_STRIDE);
 		registerReg<uint32_t>(m_s2mmFDelyStrideReg, S2MM_FRMDLY_STRIDE);
-
-		// Make sure all offsets are registered as polling offsets
-		registerPollOffset(MM2S_VDMACR);
-		registerPollOffset(MM2S_VDMASR);
-		registerPollOffset(MM2S_REG_INDEX);
-		registerPollOffset(PARK_PTR_REG);
-		registerPollOffset(VDMA_VERSION);
-		registerPollOffset(S2MM_VDMACR);
-		registerPollOffset(S2MM_VDMASR);
-		registerPollOffset(S2MM_VDMA_IRQ_MASK);
-		registerPollOffset(S2MM_REG_INDEX);
-		registerPollOffset(MM2S_VSIZE);
-		registerPollOffset(MM2S_HSIZE);
-		registerPollOffset(MM2S_FRMDLY_STRIDE);
-		registerPollOffset(MM2S_START_ADDRESS);
-		registerPollOffset(S2MM_VSIZE);
-		registerPollOffset(S2MM_HSIZE);
-		registerPollOffset(S2MM_FRMDLY_STRIDE);
-		registerPollOffset(S2MM_START_ADDRESS);
-		registerPollOffset(ENABLE_VERTICAL_FLIP);
 
 		UpdateAllRegisters();
 	}
@@ -142,7 +122,7 @@ public:
 			// Start the watchdog
 			if (!m_watchDogMM2S.Start())
 			{
-				CLAP_LOG_ERROR << CLASS_TAG("VDMA") << "Trying to start VDMA (MM2S) at: 0x" << std::hex << m_ctrlOffset << " which is still running, stopping startup ..." << std::endl;
+				CLAP_IP_CORE_LOG_ERROR << "Tried to start VDMA (MM2S) at: 0x" << std::hex << m_ctrlOffset << " which is still running, stopping startup ..." << std::endl;
 				return;
 			}
 
@@ -166,7 +146,7 @@ public:
 			// Start the watchdog
 			if (!m_watchDogS2MM.Start())
 			{
-				CLAP_LOG_ERROR << CLASS_TAG("VDMA") << "Trying to start VDMA (S2MM) at: 0x" << std::hex << m_ctrlOffset << " which is still running, stopping startup ..." << std::endl;
+				CLAP_IP_CORE_LOG_ERROR << "Tried to start VDMA (S2MM) at: 0x" << std::hex << m_ctrlOffset << " which is still running, stopping startup ..." << std::endl;
 				return;
 			}
 
@@ -198,9 +178,15 @@ public:
 	{
 		// Unset the RunStop bit
 		if (channel == DMAChannel::MM2S)
+		{
 			m_mm2sCtrlReg.Stop();
+			m_watchDogMM2S.Stop();
+		}
 		else
+		{
 			m_s2mmCtrlReg.Stop();
+			m_watchDogS2MM.Stop();
+		}
 	}
 
 	bool WaitForFinish(const DMAChannel& channel, const int32_t& timeoutMS = WAIT_INFINITE)
@@ -236,9 +222,15 @@ public:
 	void Reset(const DMAChannel& channel)
 	{
 		if (channel == DMAChannel::MM2S)
+		{
+			Stop(DMAChannel::MM2S);
 			m_mm2sCtrlReg.DoReset();
+		}
 		else
+		{
+			Stop(DMAChannel::S2MM);
 			m_s2mmCtrlReg.DoReset();
+		}
 	}
 
 	////////////////////////////////////////
@@ -395,7 +387,7 @@ private:
 	class ControlRegister : public internal::Register<uint32_t>
 	{
 	public:
-		ControlRegister(const std::string& name) :
+		explicit ControlRegister(const std::string& name) :
 			Register(name)
 		{
 			RegisterElement<bool>(&m_rs, "RS", 0);
@@ -485,7 +477,7 @@ private:
 	class StatusRegister : public internal::Register<uint32_t>, public internal::HasInterrupt
 	{
 	public:
-		StatusRegister(const std::string& name) :
+		explicit StatusRegister(const std::string& name) :
 			Register(name)
 		{
 			RegisterElement<bool>(&m_halted, "Halted", 0);
@@ -500,13 +492,12 @@ private:
 			RegisterElement<uint8_t>(&m_irqDelayCntSts, "IRQDelayCntSts", 24, 31);
 		}
 
-		void ClearInterrupts()
+		void ClearInterrupts() override
 		{
-			m_lastInterrupt = GetInterrupts();
-			ResetInterrupts(VDMA_INTR_ALL);
+			clearInterrupts();
 		}
 
-		uint32_t GetInterrupts()
+		uint32_t GetInterrupts() override
 		{
 			Update();
 			uint32_t intr = 0;
@@ -515,6 +506,11 @@ private:
 			intr |= m_errIrq << (VDMA_INTR_ON_ERROR >> 1);
 
 			return intr;
+		}
+
+		bool HasErrorIntr() const override
+		{
+			return m_errIrq;
 		}
 
 		void ResetInterrupts(const VDMAInterrupts& intr)
@@ -527,6 +523,37 @@ private:
 				m_errIrq = 1;
 
 			Update(internal::Direction::WRITE);
+		}
+
+		void Reset() override
+		{
+			reset();
+		}
+
+		void ResetStates() override
+		{
+			resetStates();
+		}
+
+	private:
+		void clearInterrupts()
+		{
+			m_lastInterrupt = GetInterrupts();
+			ResetInterrupts(VDMA_INTR_ALL);
+		}
+
+		void resetStates()
+		{
+			m_lastInterrupt = 0;
+			m_frmCntIrq     = false;
+			m_dlyCntIrq     = false;
+			m_errIrq        = false;
+		}
+
+		void reset()
+		{
+			clearInterrupts();
+			resetStates();
 		}
 
 	private:

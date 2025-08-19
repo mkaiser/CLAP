@@ -31,9 +31,9 @@ int main(int argc, char** argv)
 
 	try
 	{
-		// Create an XDMA object
+		// Create a CLAP object
 		clap::CLAPPtr pClap = clap::CLAP::Create<clap::backends::PetaLinuxBackend>();
-		// Add a DDR memory region to the XDMA
+		// Add a DDR memory region
 		pClap->AddMemoryRegion(clap::CLAP::MemoryType::DDR, DDR_BASE_ADDR, DDR_SIZE);
 
 		// Allocate memory for the data on the devices DDR
@@ -65,14 +65,14 @@ int main(int argc, char** argv)
 		axiDMA2.UseInterruptController(axiInterruptController);
 
 		if(axiDMA1.AutoDetectInterruptID())
-			axiDMA1.EnableInterrupts();
+			axiDMA1.EnableInterrupts(DMAChannel::S2MM, clap::USE_AUTO_DETECT);
 		else
-			axiDMA1.EnableInterrupts(1);
+			axiDMA1.EnableInterrupts(DMAChannel::S2MM, 1);
 
 		if(axiDMA2.AutoDetectInterruptID())
-			axiDMA2.EnableInterrupts();
+			axiDMA2.EnableInterrupts(DMAChannel::MM2S, clap::USE_AUTO_DETECT);
 		else
-			axiDMA2.EnableInterrupts(0);
+			axiDMA2.EnableInterrupts(DMAChannel::MM2S, 0);
 
 		// clap::logging::SetVerbosity(clap::logging::Verbosity::VB_DEBUG);
 

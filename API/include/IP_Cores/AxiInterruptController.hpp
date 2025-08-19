@@ -55,37 +55,23 @@ class AxiIntrCtrlUserInterrupt : virtual public UserInterruptBase
 	DISABLE_COPY_ASSIGN_MOVE(AxiIntrCtrlUserInterrupt)
 
 public:
-	AxiIntrCtrlUserInterrupt(AxiInterruptController* pAxiIntC) :
+	explicit AxiIntrCtrlUserInterrupt(AxiInterruptController* pAxiIntC) :
 		m_pAxiIntC(pAxiIntC)
 	{}
 
-	virtual void Init([[maybe_unused]] const uint32_t& devNum, [[maybe_unused]] const uint32_t& interruptNum, [[maybe_unused]] HasInterrupt* pReg = nullptr);
+	virtual void Init([[maybe_unused]] const uint32_t& devNum, [[maybe_unused]] const uint32_t& interruptNum, [[maybe_unused]] HasInterrupt* pReg = nullptr) override;
 
-	void Unset() {}
-
-	bool IsSet() const
+	bool IsSet() const override
 	{
 		return true;
 	}
 
-	bool WaitForInterrupt([[maybe_unused]] const int32_t& timeout = WAIT_INFINITE, [[maybe_unused]] const bool& runCallbacks = true)
+	bool WaitForInterrupt([[maybe_unused]] const int32_t& timeout = WAIT_INFINITE, [[maybe_unused]] const bool& runCallbacks = true) override
 	{
 		if (!m_interruptOccured && !waitForInterrupt(timeout))
 			return false;
 
 		m_interruptOccured = false;
-
-		uint32_t lastIntr = MINUS_ONE;
-		if (m_pReg)
-			lastIntr = m_pReg->GetLastInterrupt();
-
-		if (runCallbacks)
-		{
-			for (auto& callback : m_callbacks)
-				callback(lastIntr);
-		}
-
-		CLAP_LOG_DEBUG << CLASS_TAG("AxiIntrCtrlUserInterrupt") << "Interrupt present on " << m_devName << ", Interrupt Mask: " << (m_pReg ? std::to_string(lastIntr) : "No Status Register Specified") << std::endl;
 
 		return true;
 	}
@@ -95,33 +81,41 @@ public:
 		if (m_pReg)
 			m_pReg->ClearInterrupts();
 
+		uint32_t lastIntr = UNSET_INTR_MASK;
+		if (m_pReg)
+			lastIntr = m_pReg->GetLastInterrupt();
+
+		CLAP_CLASS_LOG_DEBUG << "Interrupt present on " << m_devName << ", Interrupt Mask: " << (m_pReg ? std::to_string(lastIntr) : "No Interrupt Status Register Specified") << std::endl;
+
+		processCallbacks(m_runCallbacks, lastIntr);
+
 		m_interruptOccured = true;
 #ifndef EMBEDDED_XILINX
 		m_cv.notify_all();
-#else
-		WaitForInterrupt();
 #endif
-		CLAP_LOG_DEBUG << CLASS_TAG("AxiIntrCtrlUserInterrupt") << "Interrupt triggered on " << m_devName << std::endl;
 	}
 
 private:
+	/// @brief Wait for the interrupt to occur
+	/// @param timeout The timeout in microseconds for BareMetal or milliseconds for Linux. Default is WAIT_INFINITE, which means no timeout.
+	/// @return
 	bool waitForInterrupt([[maybe_unused]] const int32_t& timeout = WAIT_INFINITE)
 	{
 		// The interruptOccured flag is used to make sure that the interrupt has not already occured
 #ifdef EMBEDDED_XILINX
-		uint64_t ticks              = 0;
-		const uint64_t timeoutTicks = timeout * 1000;
+		const uint64_t timeoutTicks = static_cast<uint64_t>(timeout);
 
 		if (timeout == WAIT_INFINITE)
 		{
 			while (!m_interruptOccured)
-				usleep(1);
+				utils::SleepUS(1);
 		}
 		else
 		{
+			uint64_t ticks = 0;
 			while (!m_interruptOccured && ticks < timeoutTicks)
 			{
-				usleep(1);
+				utils::SleepUS(1);
 				ticks++;
 			}
 
@@ -129,8 +123,7 @@ private:
 				return false;
 		}
 #else
-		std::mutex mtx;
-		std::unique_lock<std::mutex> lck(mtx);
+		std::unique_lock<std::mutex> lck(m_mtx);
 
 		if (!m_interruptOccured)
 		{
@@ -151,8 +144,10 @@ private:
 	AxiInterruptController* m_pAxiIntC;
 #ifndef EMBEDDED_XILINX
 	std::condition_variable m_cv = {};
+	std::mutex m_mtx             = {};
 #endif
 	bool m_interruptOccured = false;
+	bool m_runCallbacks     = true;
 };
 } // namespace internal
 
@@ -176,8 +171,8 @@ class AxiInterruptController : public internal::RegisterControlBase
 	};
 
 public:
-	AxiInterruptController(const CLAPPtr& pClap, const uint64_t& ctrlOffset) :
-		RegisterControlBase(pClap, ctrlOffset),
+	AxiInterruptController(const CLAPPtr& pClap, const uint64_t& ctrlOffset, const std::string& name = "") :
+		RegisterControlBase(pClap, ctrlOffset, name),
 		m_watchDog("AxiInterruptController", pClap->MakeUserInterrupt()),
 		m_mutex()
 	{
@@ -197,13 +192,14 @@ public:
 		m_watchDog.RegisterInterruptCallback(std::bind(&AxiInterruptController::CoreInterruptTriggered, this, std::placeholders::_1));
 	}
 
-	virtual ~AxiInterruptController()
+	virtual ~AxiInterruptController() override
 	{
 		Stop();
 	}
 
 	void Reset()
 	{
+		Stop();
 		m_intrAckReg.AcknowledgeAllInterrupts();
 		m_intrStatusReg.Reset();
 		m_intrPendingReg.Reset();
@@ -229,14 +225,14 @@ public:
 
 		uint32_t intrID = eventNo;
 
-		if (m_detectedInterruptID != -1)
+		if (m_detectedInterruptID != INTR_UNDEFINED)
 			intrID = static_cast<uint32_t>(m_detectedInterruptID);
 
 		m_watchDog.InitInterrupt(getDevNum(), intrID);
 
 		if (!m_watchDog.Start(true))
 		{
-			CLAP_LOG_ERROR << CLASS_TAG("AxiInterruptController") << "Trying to start Controller at: 0x" << std::hex << m_ctrlOffset << " which is already running, stopping startup ..." << std::endl;
+			CLAP_IP_CORE_LOG_ERROR << "Tried to start Controller at: 0x" << std::hex << m_ctrlOffset << " which is already running, stopping startup ..." << std::endl;
 			return false;
 		}
 
@@ -246,11 +242,11 @@ public:
 	void Stop()
 	{
 		if (!m_running) return;
-		CLAP_LOG_INFO << CLASS_TAG("AxiInterruptController") << "Stopping Controller at: 0x" << std::hex << m_ctrlOffset << std::dec << " ... " << std::flush;
+		CLAP_IP_CORE_LOG_INFO << "Stopping Controller at: 0x" << std::hex << m_ctrlOffset << std::dec << " ... " << std::flush;
 		stop();
 
 		m_watchDog.Stop();
-		m_watchDog.UnsetInterrupt();
+		// m_watchDog.UnsetInterrupt();
 
 		m_running = false;
 
@@ -270,12 +266,12 @@ public:
 		std::lock_guard<std::mutex> lock(m_mutex);
 
 		uint32_t intrs = m_intrStatusReg.GetInterrupts();
-		uint32_t idx   = 0;
 
-		CLAP_LOG_DEBUG << CLASS_TAG("AxiInterruptController") << "CoreInterruptTriggered: " << std::hex << intrs << std::endl;
+		CLAP_IP_CORE_LOG_DEBUG << "CoreInterruptTriggered: " << std::hex << intrs << std::endl;
 
 		try
 		{
+			uint32_t idx = 0;
 			while (intrs > 0)
 			{
 				if (intrs & 1)

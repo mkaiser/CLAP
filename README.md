@@ -260,8 +260,8 @@ For Baremetal it is currently required to increase the size of the **STACK**, **
 ```c
 STACK_SIZE     = 0x10000;
 HEAP_SIZE      = 0x20000;
-// Only present on 32-bit systems
-IRQ_STACK_SIZE =  0x1000;
+// Only present on 32-bit systems -- Might need to be increased further, depending on the application
+IRQ_STACK_SIZE =  0x2000;
 ```
 
 Furthermore, the `EMBEDDED_XILINX` define has to be set before including the CLAP API. This can be done by either adding the following to the compiler flags:
@@ -275,3 +275,26 @@ Or by adding the following to the source code before the first CLAP include:
 ```c
 #define EMBEDDED_XILINX
 ```
+
+Using the `CLAP_USE_XIL_PRINTF` define, the logging system can be forced to use the Xilinx `xil_printf` function instead of `std::cout`. This can be useful when `std::cout` is not available in the Baremetal environment. Similar to the `EMBEDDED_XILINX` define, it can be set either via the compiler flags:
+
+```c
+-D CLAP_USE_XIL_PRINTF
+```
+
+Or by adding the following to the source code before the first CLAP include:
+
+```c
+#define CLAP_USE_XIL_PRINTF
+```
+
+
+## List of CLAP Specific Defines
+
+- `EMBEDDED_XILINX`: When defined, the API is compiled for a Baremetal environment on a Xilinx FPGA.
+- `CLAP_USE_XIL_PRINTF`: When defined, the API uses `xil_printf` instead of `std::cout` for logging.
+- `CLAP_DISABLE_SRW_SIG_HANDLER`: When defined, the SoloRunWarden does not install signal handlers for the SIGINT and SIGTERM signals. This can be useful when the application already has signal handlers installed for these signals.
+- `CLAP_DISABLE_LOGGING`: When defined, all logging is disabled. This can be useful when the application does not require any of the internal logging.
+- `CLAP_IP_CORE_LOG_ALT_STYLE`: When defined, the logging style of the IP core is changed to a more compact style, integrating the IP core name into the log message. This can be useful when the application requires a more compact log output.
+- `CLAP_SKIP_SLEEP_H_INC`: When defined, in BareMetal setups the `sleep.h` header is not included, and the sleep implementations from `unistd.h` are used instead. This might be required to mitigate collisions when the application code uses the `sleep` or `usleep` functions, as the declarations in `sleep.h` conflicts with that in `unistd.h`. Alternatively, the CLAP sleep wrapper functions `clap::utils::Sleep[MS|US]` can be used to avoid the conflict.
+- `CLAP_ENABLE_RW_LOG`: When defined, for each read and write operation a log message is generated, containing the target address, address of the data to be written and the size of the data. This can be useful for debugging purposes, but should be disabled in production code, as it can generate a large amount of log messages.

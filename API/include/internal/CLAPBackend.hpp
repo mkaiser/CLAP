@@ -43,6 +43,12 @@
 #include "Types.hpp"
 #include "UserInterruptBase.hpp"
 
+#ifdef CLAP_ENABLE_RW_LOG
+#define CLAP_RW_LOG CLAP_CLASS_LOG_DEBUG << "addr=0x" << std::hex << addr << " pData=0x" << pData << " sizeInByte=0x" << sizeInByte << std::dec << std::endl;
+#else
+#define CLAP_RW_LOG
+#endif
+
 namespace clap
 {
 namespace internal
@@ -64,7 +70,11 @@ public:
 
 	virtual void Read(const uint64_t& addr, void* pData, const uint64_t& sizeInByte)        = 0;
 	virtual void Write(const uint64_t& addr, const void* pData, const uint64_t& sizeInByte) = 0;
-	virtual void ReadCtrl(const uint64_t& addr, uint64_t& data, const std::size_t& byteCnt) = 0;
+
+	virtual void ReadCtrl([[maybe_unused]] const uint64_t& addr, [[maybe_unused]] uint64_t& data, [[maybe_unused]] const std::size_t& byteCnt)
+	{
+		throw CLAPException("ReadCtrl not implemented");
+	}
 
 	virtual Expected<uint64_t> ReadUIOProperty([[maybe_unused]] const uint64_t& addr, [[maybe_unused]] const std::string& propName) const
 	{
@@ -79,6 +89,11 @@ public:
 	virtual Expected<std::vector<uint64_t>> ReadUIOPropertyVec([[maybe_unused]] const uint64_t& addr, [[maybe_unused]] const std::string& propName) const
 	{
 		return MakeUnexpected();
+	}
+
+	virtual bool CheckUIOPropertyExists([[maybe_unused]] const uint64_t& addr, [[maybe_unused]] const std::string& propName) const
+	{
+		return false;
 	}
 
 	virtual Expected<int32_t> GetUIOID([[maybe_unused]] const uint64_t& addr) const
@@ -108,43 +123,34 @@ public:
 		return m_backendName;
 	}
 
-	void AddPollAddr(const uint64_t& addr)
+	void SetLogByteThreshold(const uint64_t& threshold)
 	{
-		if (std::find(m_pollAddrs.begin(), m_pollAddrs.end(), addr) == m_pollAddrs.end())
-			m_pollAddrs.push_back(addr);
+		m_logByteThreshold = threshold;
 	}
 
-	void RemovePollAddr(const uint64_t& addr)
+	const uint64_t& GetLogByteThreshold() const
 	{
-		for (auto it = m_pollAddrs.begin(); it != m_pollAddrs.end(); it++)
-		{
-			if (*it == addr)
-			{
-				m_pollAddrs.erase(it);
-				break;
-			}
-		}
+		return m_logByteThreshold;
 	}
 
 protected:
-	void logTransferTime(const uint64_t& addr, const uint64_t& sizeInByte, const Timer& timer, const bool& reading)
+	void logTransferTime(const uint64_t& sizeInByte, const Timer& timer, const bool& reading)
 	{
+		if (sizeInByte <= m_logByteThreshold)
+			return;
+
 		// Get the time in seconds, if the time is 0.0, set it to 1ns to avoid division by 0
 		const double tSec = (timer.GetElapsedTime() == 0.0 ? 1.0e-9 : timer.GetElapsedTime());
 
-		// Only log if the address is not in the poll list
-		if (std::find(m_pollAddrs.begin(), m_pollAddrs.end(), addr) == m_pollAddrs.end())
+		if (reading)
 		{
-			if (reading)
-			{
-				CLAP_LOG_VERBOSE << "Reading " << sizeInByte << " byte (" << utils::SizeWithSuffix(sizeInByte) << ") from the device took " << timer.GetElapsedTimeInMilliSec()
-								 << " ms (" << utils::SpeedWidthSuffix(sizeInByte / tSec) << ")" << std::endl;
-			}
-			else
-			{
-				CLAP_LOG_VERBOSE << "Writing " << sizeInByte << " byte (" << utils::SizeWithSuffix(sizeInByte) << ") to the device took " << timer.GetElapsedTimeInMilliSec()
-								 << " ms (" << utils::SpeedWidthSuffix(sizeInByte / tSec) << ")" << std::endl;
-			}
+			CLAP_CLASS_LOG_VERBOSE << "Reading " << sizeInByte << " byte (" << utils::SizeWithSuffix(sizeInByte) << ") from the device took " << timer.GetElapsedTimeInMilliSec()
+								   << " ms (" << utils::SpeedWidthSuffix(sizeInByte / tSec) << ")" << std::endl;
+		}
+		else
+		{
+			CLAP_CLASS_LOG_VERBOSE << "Writing " << sizeInByte << " byte (" << utils::SizeWithSuffix(sizeInByte) << ") to the device took " << timer.GetElapsedTimeInMilliSec()
+								   << " ms (" << utils::SpeedWidthSuffix(sizeInByte / tSec) << ")" << std::endl;
 		}
 	}
 
@@ -155,7 +161,7 @@ protected:
 	std::string m_nameCtrl    = "";
 	std::string m_backendName = "CLAP";
 
-	std::vector<uint64_t> m_pollAddrs = {};
+	uint64_t m_logByteThreshold = 8;
 };
 } // namespace internal
 } // namespace clap

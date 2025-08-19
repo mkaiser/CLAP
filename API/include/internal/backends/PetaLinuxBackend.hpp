@@ -60,7 +60,12 @@ public:
 		m_pollFd()
 	{}
 
-	virtual void Init([[maybe_unused]] const uint32_t& devNum, [[maybe_unused]] const uint32_t& interruptNum, HasInterrupt* pReg = nullptr)
+	~PetaLinuxUserInterrupt() override
+	{
+		unset();
+	}
+
+	void Init([[maybe_unused]] const uint32_t& devNum, [[maybe_unused]] const uint32_t& interruptNum, HasInterrupt* pReg = nullptr) override
 	{
 		if (DEVICE_HANDLE_VALID(m_fd))
 			Unset();
@@ -74,7 +79,7 @@ public:
 		if (!DEVICE_HANDLE_VALID(m_fd))
 		{
 			std::stringstream ss;
-			ss << CLASS_TAG("PetaLinuxUserInterrupt") << "Unable to open device " << m_devName << "; errno: " << errsv;
+			ss << CLASS_TAG_AUTO << "Unable to open device " << m_devName << "; errno: " << errsv;
 			throw UserInterruptException(ss.str());
 		}
 
@@ -85,25 +90,22 @@ public:
 		unmask();
 	}
 
-	void Unset()
+	void Unset() override
 	{
-		CloseDevice(m_fd);
-
-		m_pollFd.fd = -1;
-		m_pReg      = nullptr;
+		unset();
 	}
 
-	bool IsSet() const
+	bool IsSet() const override
 	{
 		return (DEVICE_HANDLE_VALID(m_fd));
 	}
 
-	bool WaitForInterrupt([[maybe_unused]] const int32_t& timeout = WAIT_INFINITE, [[maybe_unused]] const bool& runCallbacks = true)
+	bool WaitForInterrupt([[maybe_unused]] const int32_t& timeout = WAIT_INFINITE, [[maybe_unused]] const bool& runCallbacks = true) override
 	{
 		if (!IsSet())
 		{
 			std::stringstream ss("");
-			ss << CLASS_TAG("PetaLinuxUserInterrupt") << "Error: Trying to wait for uninitialized user interrupt";
+			ss << CLASS_TAG_AUTO << "Error: Tried to wait for uninitialized user interrupt";
 			throw UserInterruptException(ss.str());
 		}
 
@@ -124,30 +126,34 @@ public:
 			if (rc < 0)
 			{
 				std::stringstream ss;
-				ss << CLASS_TAG("PetaLinuxUserInterrupt") << m_devName << ", call to read failed (rc: " << rc << ") errno: " << errsv;
+				ss << CLASS_TAG_AUTO << m_devName << ", call to read failed (rc: " << rc << ") errno: " << errsv;
 				throw UserInterruptException(ss.str());
 			}
 
-			uint32_t lastIntr = -1;
+			uint32_t lastIntr = UNSET_INTR_MASK;
 			if (m_pReg)
 				lastIntr = m_pReg->GetLastInterrupt();
 
-			if (runCallbacks)
-			{
-				for (auto& callback : m_callbacks)
-					callback(lastIntr);
-			}
+			processCallbacks(runCallbacks, lastIntr);
 
-			CLAP_LOG_DEBUG << CLASS_TAG("PetaLinuxUserInterrupt") << "Interrupt present on " << m_devName << ", events: " << events << ", Interrupt Mask: " << (m_pReg ? std::to_string(m_pReg->GetLastInterrupt()) : "No Status Register Specified") << std::endl;
+			CLAP_CLASS_LOG_DEBUG << "Interrupt present on " << m_devName << ", events: " << events << ", Interrupt Mask: " << (m_pReg ? std::to_string(m_pReg->GetLastInterrupt()) : "No Interrupt Status Register Specified") << std::endl;
 			return true;
 		}
 		// else
-		// 	CLAP_LOG_DEBUG << CLASS_TAG("PetaLinuxUserInterrupt") << "No Interrupt present on " << m_devName << std::endl;
+		// 	CLAP_CLASS_LOG_DEBUG << "No Interrupt present on " << m_devName << std::endl;
 
 		return false;
 	}
 
 private:
+	void unset()
+	{
+		CloseDevice(m_fd);
+
+		m_pollFd.fd = INVALID_HANDLE;
+		m_pReg      = nullptr;
+	}
+
 	void unmask()
 	{
 		const uint32_t unmask = 1;
@@ -156,7 +162,7 @@ private:
 		if (nb != static_cast<ssize_t>(sizeof(unmask)))
 		{
 			std::stringstream ss;
-			ss << CLASS_TAG("PetaLinuxUserInterrupt") << "Error: Unable to unmask interrupt on " << m_devName;
+			ss << CLASS_TAG_AUTO << "Error: Unable to unmask interrupt on " << m_devName;
 			throw UserInterruptException(ss.str());
 		}
 	}
@@ -177,7 +183,7 @@ class PetaLinuxBackend : virtual public CLAPBackend
 	};
 
 public:
-	PetaLinuxBackend([[maybe_unused]] const uint32_t& deviceNum = 0, [[maybe_unused]] const uint32_t& channelNum = 0) :
+	explicit PetaLinuxBackend([[maybe_unused]] const uint32_t& deviceNum = 0, [[maybe_unused]] const uint32_t& channelNum = 0) :
 		m_readMutex(),
 		m_writeMutex()
 	{
@@ -185,7 +191,7 @@ public:
 
 		if (!initUIO())
 		{
-			CLAP_LOG_INFO << CLASS_TAG("PetaLinuxBackend") << "UIO not available, falling back to /dev/mem" << std::endl;
+			CLAP_CLASS_LOG_INFO << "UIO not available, falling back to /dev/mem" << std::endl;
 			m_nameRead  = m_devMem;
 			m_nameWrite = m_devMem;
 			m_fd        = OpenDevice(m_devMem);
@@ -193,16 +199,16 @@ public:
 		}
 	}
 
-	void Read(const uint64_t& addr, void* pData, const uint64_t& sizeInByte)
+	void Read(const uint64_t& addr, void* pData, const uint64_t& sizeInByte) override
 	{
-		// CLAP_LOG_DEBUG << CLASS_TAG("PetaLinuxBackend") << "addr=0x" << std::hex << addr << " pData=0x" << pData << " sizeInByte=0x" << sizeInByte << std::dec << std::endl;
+		CLAP_RW_LOG
 
 		std::lock_guard<std::mutex> lock(m_readMutex);
 
 		if (!m_valid)
 		{
 			std::stringstream ss;
-			ss << CLASS_TAG("PetaLinuxBackend") << "CLAP Instance is not valid, an error probably occurred during device initialization.";
+			ss << CLASS_TAG_AUTO << "CLAP Instance is not valid, an error probably occurred during device initialization.";
 			throw CLAPException(ss.str());
 		}
 
@@ -221,23 +227,23 @@ public:
 		if (count != sizeInByte)
 		{
 			std::stringstream ss;
-			ss << CLASS_TAG("PetaLinuxBackend") << m_nameRead << ", failed to read 0x" << std::hex << sizeInByte << " byte from addr 0x" << addr << " (read: 0x" << count << " byte)" << std::dec;
+			ss << CLASS_TAG_AUTO << m_nameRead << ", failed to read 0x" << std::hex << sizeInByte << " byte from addr 0x" << addr << " (read: 0x" << count << " byte)" << std::dec;
 			throw CLAPException(ss.str());
 		}
 
-		logTransferTime(addr, sizeInByte, timer, true);
+		logTransferTime(sizeInByte, timer, true);
 	}
 
-	void Write(const uint64_t& addr, const void* pData, const uint64_t& sizeInByte)
+	void Write(const uint64_t& addr, const void* pData, const uint64_t& sizeInByte) override
 	{
-		// CLAP_LOG_DEBUG << CLASS_TAG("PetaLinuxBackend") << "addr=0x" << std::hex << addr << " pData=0x" << pData << " sizeInByte=0x" << sizeInByte << std::dec << std::endl;
+		CLAP_RW_LOG
 
 		std::lock_guard<std::mutex> lock(m_writeMutex);
 
 		if (!m_valid)
 		{
 			std::stringstream ss;
-			ss << CLASS_TAG("PetaLinuxBackend") << "CLAP Instance is not valid, an error probably occurred during device initialization.";
+			ss << CLASS_TAG_AUTO << "CLAP Instance is not valid, an error probably occurred during device initialization.";
 			throw CLAPException(ss.str());
 		}
 
@@ -256,19 +262,14 @@ public:
 		if (count != sizeInByte)
 		{
 			std::stringstream ss;
-			ss << CLASS_TAG("PetaLinuxBackend") << m_nameWrite << ", failed to write 0x" << std::hex << sizeInByte << " byte to addr 0x" << addr << " (wrote: 0x" << count << " byte)" << std::dec;
+			ss << CLASS_TAG_AUTO << m_nameWrite << ", failed to write 0x" << std::hex << sizeInByte << " byte to addr 0x" << addr << " (wrote: 0x" << count << " byte)" << std::dec;
 			throw CLAPException(ss.str());
 		}
 
-		logTransferTime(addr, sizeInByte, timer, false);
+		logTransferTime(sizeInByte, timer, false);
 	}
 
-	void ReadCtrl([[maybe_unused]] const uint64_t& addr, [[maybe_unused]] uint64_t& data, [[maybe_unused]] const std::size_t& byteCnt)
-	{
-		CLAP_LOG_DEBUG << CLASS_TAG("PetaLinuxBackend") << "ReadCtrl is currently not implemented by the PetaLinux backend." << std::endl;
-	}
-
-	UserInterruptPtr MakeUserInterrupt() const
+	UserInterruptPtr MakeUserInterrupt() const override
 	{
 		return std::make_unique<PetaLinuxUserInterrupt>();
 	}
@@ -294,7 +295,7 @@ private:
 		if (!dev)
 		{
 			std::stringstream ss;
-			ss << CLASS_TAG("PetaLinuxBackend") << "Failed to find UIO device for address 0x" << std::hex << addr << std::dec;
+			ss << CLASS_TAG_AUTO << "Failed to find UIO device for address 0x" << std::hex << addr << std::dec;
 			throw CLAPException(ss.str());
 		}
 
@@ -307,7 +308,7 @@ private:
 		if (!dev)
 		{
 			std::stringstream ss;
-			ss << CLASS_TAG("PetaLinuxBackend") << "Failed to find UIO device for address 0x" << std::hex << addr << std::dec;
+			ss << CLASS_TAG_AUTO << "Failed to find UIO device for address 0x" << std::hex << addr << std::dec;
 			throw CLAPException(ss.str());
 		}
 
@@ -374,7 +375,7 @@ private:
 		return count;
 	}
 
-	Expected<uint64_t> ReadUIOProperty(const uint64_t& addr, const std::string& propName) const
+	Expected<uint64_t> ReadUIOProperty(const uint64_t& addr, const std::string& propName) const override
 	{
 		const UioDev<UIOAddrType>& dev = m_uioManager.FindUioDevByAddr(addr);
 		if (!dev) return MakeUnexpected();
@@ -382,12 +383,12 @@ private:
 		return dev.ReadBinaryProperty<uint32_t>(propName);
 	}
 
-	Expected<std::string> ReadUIOStringProperty(const uint64_t& addr, const std::string& propName) const
+	Expected<std::string> ReadUIOStringProperty(const uint64_t& addr, const std::string& propName) const override
 	{
 		const UioDev<UIOAddrType>& dev = m_uioManager.FindUioDevByAddr(addr);
 		if (!dev)
 		{
-			CLAP_LOG_ERROR << CLASS_TAG("PetaLinuxBackend") << "Failed to find UIO device for address 0x" << std::hex << addr << std::dec << std::endl;
+			CLAP_CLASS_LOG_ERROR << "Failed to find UIO device for address 0x" << std::hex << addr << std::dec << std::endl;
 			return MakeUnexpected();
 		}
 
@@ -395,7 +396,7 @@ private:
 	}
 
 	// TODO: Check if the properties are always 32-bit values or if they are 64-bit values on 64-bit systems
-	Expected<std::vector<uint64_t>> ReadUIOPropertyVec([[maybe_unused]] const uint64_t& addr, [[maybe_unused]] const std::string& propName) const
+	Expected<std::vector<uint64_t>> ReadUIOPropertyVec([[maybe_unused]] const uint64_t& addr, [[maybe_unused]] const std::string& propName) const override
 	{
 		const UioDev<UIOAddrType>& dev = m_uioManager.FindUioDevByAddr(addr);
 		if (!dev) return MakeUnexpected();
@@ -406,13 +407,20 @@ private:
 
 		std::vector<uint64_t> res64;
 		res64.reserve(res.Value().size());
-		for (const auto& r : res.Value())
-			res64.push_back(r);
+		std::copy(res.Value().begin(), res.Value().end(), std::back_inserter(res64));
 
 		return res64;
 	}
 
-	Expected<int32_t> GetUIOID([[maybe_unused]] const uint64_t& addr) const
+	bool CheckUIOPropertyExists(const uint64_t& addr, const std::string& propName) const override
+	{
+		const UioDev<UIOAddrType>& dev = m_uioManager.FindUioDevByAddr(addr);
+		if (!dev) return false;
+
+		return dev.CheckPropertyExists(propName);
+	}
+
+	Expected<int32_t> GetUIOID([[maybe_unused]] const uint64_t& addr) const override
 	{
 		const UioDev<UIOAddrType>& dev = m_uioManager.FindUioDevByAddr(addr);
 		if (!dev) return MakeUnexpected();
@@ -422,7 +430,7 @@ private:
 
 private:
 	const std::string m_devMem = "/dev/mem";
-	int32_t m_fd               = -1;
+	int32_t m_fd               = INVALID_HANDLE;
 	std::mutex m_readMutex;
 	std::mutex m_writeMutex;
 	Mode m_mode                          = Mode::DevMem;

@@ -138,7 +138,7 @@ public:
 		if (m_pValue == nullptr)
 		{
 			std::stringstream ss("");
-			ss << "ERROR: Trying to create RegElem (" << m_name << ": " << static_cast<uint32_t>(m_startBit) << "-" << static_cast<uint32_t>(m_endBit) << ") without a valid pointer";
+			ss << "ERROR: Tried to create RegElem (" << m_name << ": " << static_cast<uint32_t>(m_startBit) << "-" << static_cast<uint32_t>(m_endBit) << ") without a valid pointer";
 			throw std::runtime_error(ss.str());
 		}
 	}
@@ -178,7 +178,7 @@ private:
 		if (m_pValue == nullptr)
 		{
 			std::stringstream ss("");
-			ss << "ERROR: Trying to use RegElem (" << m_name << ": " << static_cast<uint32_t>(m_startBit) << "-" << static_cast<uint32_t>(m_endBit) << ") whoes pointer is invalid";
+			ss << "ERROR: Tried to use RegElem (" << m_name << ": " << static_cast<uint32_t>(m_startBit) << "-" << static_cast<uint32_t>(m_endBit) << ") whoes pointer is invalid";
 			throw std::runtime_error(ss.str());
 		}
 	}
@@ -205,6 +205,13 @@ class RegisterIntf
 	DISABLE_COPY_ASSIGN_MOVE(RegisterIntf)
 
 public:
+	enum class RegUpdate
+	{
+		Update,
+		NoUpdate
+	};
+
+public:
 	RegisterIntf() {}
 
 	virtual ~RegisterIntf() {}
@@ -226,7 +233,7 @@ public:
 	using UpdateCB = void(Register<T>*, const uint64_t&, const Direction&, void*);
 
 public:
-	Register(const std::string& name) :
+	explicit Register(const std::string& name) :
 		m_regElems(),
 		m_registerBitSize(sizeof(T) * 8),
 		m_name(name)
@@ -247,14 +254,14 @@ public:
 		// Check if the target bit space exceeds the possible range
 		if (startBitUse > m_registerBitSize || (endBitUse > m_registerBitSize && endBitUse != SAME_AS_START_BIT))
 		{
-			CLAP_LOG_ERROR << CLASS_TAG("") << "ERROR: Trying to register element: \"" << name << "\" whose bit space (" << startBitUse << "-" << endBitUse
-						   << ") exceeds the registers bit size (" << m_registerBitSize << ")" << std::endl;
+			CLAP_CLASS_LOG_ERROR << "ERROR: Tried to register element: \"" << name << "\" whose bit space (" << startBitUse << "-" << endBitUse
+								 << ") exceeds the registers bit size (" << m_registerBitSize << ")" << std::endl;
 			return;
 		}
 
 		if (startBitUse > endBitUse)
 		{
-			CLAP_LOG_WARNING << CLASS_TAG("") << "WARNING: Start bit (" << static_cast<uint32_t>(startBitUse) << ") is greater than end bit (" << static_cast<uint32_t>(endBitUse) << "), swapping the values" << std::endl;
+			CLAP_CLASS_LOG_WARNING << "WARNING: Start bit (" << static_cast<uint32_t>(startBitUse) << ") is greater than end bit (" << static_cast<uint32_t>(endBitUse) << "), swapping the values" << std::endl;
 			startBitUse = endBit;
 			endBitUse   = startBit;
 		}
@@ -266,15 +273,15 @@ public:
 		// Check if the the entire or a part of the bit range have already been registered
 		if ((m_regUsage & shiftVal) != 0)
 		{
-			CLAP_LOG_ERROR << CLASS_TAG("") << "ERROR: Trying to register element: \"" << name << "\" whose bit space ("
-						   << static_cast<uint32_t>(startBitUse) << "-" << static_cast<uint32_t>(endBitUse)
-						   << ") has already been registered, either entirely or partially by:" << std::endl;
+			CLAP_CLASS_LOG_ERROR << "ERROR: Tried to register element: \"" << name << "\" whose bit space ("
+								 << static_cast<uint32_t>(startBitUse) << "-" << static_cast<uint32_t>(endBitUse)
+								 << ") has already been registered, either entirely or partially by:" << std::endl;
 
 			// Print the elements occupying the target bit space
 			for (const RegIntfPtr& pRElem : m_regElems)
 			{
 				if ((pRElem->GetShiftValue() & shiftVal) != 0)
-					CLAP_LOG_ERROR << pRElem->GetName() << " " << static_cast<uint32_t>(pRElem->GetStartBit()) << "-" << static_cast<uint32_t>(pRElem->GetEndBit()) << std::endl;
+					CLAP_CLASS_LOG_ERROR << pRElem->GetName() << " " << static_cast<uint32_t>(pRElem->GetStartBit()) << "-" << static_cast<uint32_t>(pRElem->GetEndBit()) << std::endl;
 			}
 
 			return;
@@ -295,7 +302,7 @@ public:
 	}
 
 	// Triggers the callback based update process for the given direction
-	void Update(const Direction& dir = Direction::READ)
+	void Update(const Direction& dir = Direction::READ) override
 	{
 		if (m_pCallBackObject == nullptr) return;
 		m_pUpdateCB(this, m_offset, dir, m_pCallBackObject);
@@ -320,10 +327,10 @@ public:
 	}
 
 	// Print the register in a register address map
-	void Print(bool update = false)
+	void Print(const RegUpdate& update = RegUpdate::Update)
 	{
 		// If the update flag is set, update the register before printing
-		if (update) Update();
+		if (update == RegUpdate::Update) Update();
 
 		// Search for the max name length
 		const RegIntfPtr maxElem = *std::max_element(m_regElems.begin(), m_regElems.end(), [](const RegIntfPtr lhs, const RegIntfPtr rhs) { return lhs->GetName().length() < rhs->GetName().length(); });
@@ -392,6 +399,8 @@ public:
 		CLAP_LOG_INFO << std::endl;
 	}
 
+	virtual void PostRegistration() {}
+
 private:
 	std::vector<RegIntfPtr> m_regElems;
 	uint32_t m_registerBitSize;
@@ -452,10 +461,24 @@ public:
 		return 0;
 	}
 
+	virtual bool HasDoneIntr() const
+	{
+		return true;
+	}
+
+	virtual bool HasErrorIntr() const
+	{
+		return false;
+	}
+
 	uint32_t GetLastInterrupt() const
 	{
 		return m_lastInterrupt;
 	}
+
+	virtual void Reset() {}
+
+	virtual void ResetStates() {}
 
 protected:
 	uint32_t m_lastInterrupt = 0;
@@ -464,14 +487,7 @@ protected:
 class Bit32Register : public Register<uint32_t>
 {
 public:
-	enum class RegUpdate
-	{
-		Update,
-		NoUpdate
-	};
-
-public:
-	Bit32Register(const std::string& name) :
+	explicit Bit32Register(const std::string& name) :
 		Register(name)
 	{
 		for (std::size_t i = 0; i < m_bits.size(); i++)

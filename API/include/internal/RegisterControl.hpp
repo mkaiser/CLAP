@@ -33,8 +33,34 @@
 #include "Types.hpp"
 
 #include <cstdint>
-#include <cxxabi.h>
 #include <vector>
+
+#ifdef CLAP_IP_CORE_LOG_ALT_STYLE
+#define CLAP_IP_CORE_LOG_DEBUG   CLAP_CLASS_LOG_WITH_NAME_DEBUG(GetName())
+#define CLAP_IP_CORE_LOG_VERBOSE CLAP_CLASS_LOG_WITH_NAME_VERBOSE(GetName())
+#define CLAP_IP_CORE_LOG_INFO    CLAP_CLASS_LOG_WITH_NAME_INFO(GetName())
+#define CLAP_IP_CORE_LOG_WARNING CLAP_CLASS_LOG_WITH_NAME_WARNING(GetName())
+#define CLAP_IP_CORE_LOG_ERROR   CLAP_CLASS_LOG_WITH_NAME_ERROR(GetName())
+
+#define CLAP_IP_EXCEPTION_TAG CLASS_TAG_AUTO_WITH_NAME(GetName())
+#else
+#define CLAP_IP_CORE_LOG_DEBUG   CLAP_CLASS_LOG_DEBUG << nameTag()
+#define CLAP_IP_CORE_LOG_VERBOSE CLAP_CLASS_LOG_VERBOSE << nameTag()
+#define CLAP_IP_CORE_LOG_INFO    CLAP_CLASS_LOG_INFO << nameTag()
+#define CLAP_IP_CORE_LOG_WARNING CLAP_CLASS_LOG_WARNING << nameTag()
+#define CLAP_IP_CORE_LOG_ERROR   CLAP_CLASS_LOG_ERROR << nameTag()
+
+#define CLAP_IP_EXCEPTION_TAG CLASS_TAG_AUTO << nameTag()
+#endif
+
+#ifndef BUILD_IP_EXCEPTION
+#define BUILD_IP_EXCEPTION(__EXPT__, __MSG__)   \
+	{                                           \
+		std::stringstream ss;                   \
+		ss << CLAP_IP_EXCEPTION_TAG << __MSG__; \
+		throw __EXPT__(ss.str());               \
+	}
+#endif
 
 // TODO: Move this to a more appropriate place
 enum class DMAChannel
@@ -43,7 +69,7 @@ enum class DMAChannel
 	S2MM
 };
 
-static inline std::ostream& operator<<(std::ostream& os, const DMAChannel& channel)
+inline std::ostream& operator<<(std::ostream& os, const DMAChannel& channel)
 {
 	switch (channel)
 	{
@@ -63,6 +89,13 @@ static inline std::ostream& operator<<(std::ostream& os, const DMAChannel& chann
 
 namespace clap
 {
+	enum class PostRegisterReg
+	{
+		RunUpdate,
+		RunPostRegFunction,
+		DoNothing
+	};
+
 namespace internal
 {
 class RegisterControlBase : public CLAPManaged
@@ -70,17 +103,15 @@ class RegisterControlBase : public CLAPManaged
 	DISABLE_COPY_ASSIGN_MOVE(RegisterControlBase)
 
 public:
-	RegisterControlBase(CLAPBasePtr pClap, const uint64_t& ctrlOffset) :
+	RegisterControlBase(CLAPBasePtr pClap, const uint64_t& ctrlOffset, const std::string& name = "") :
 		CLAPManaged(std::move(pClap)),
+		m_name(name),
 		m_ctrlOffset(ctrlOffset),
 		m_registers()
 	{
-		// Register the control address as a polling address, causing it to be ignored when printing transfer times
-		// this is done to prevent log flooding when the control register is polled
-		CLAP()->AddPollAddress(ctrlOffset);
 	}
 
-	virtual ~RegisterControlBase() = default;
+	virtual ~RegisterControlBase() override = default;
 
 	// Method used by the static update callback function to update the given register
 	template<typename T>
@@ -105,6 +136,16 @@ public:
 		return detectInterruptID();
 	}
 
+	void SetName(const std::string& name)
+	{
+		m_name = name;
+	}
+
+	const std::string& GetName() const
+	{
+		return m_name;
+	}
+
 	// Callback function, called by the register when the Update() method is called
 	template<typename T>
 	static void UpdateCallBack(Register<T>* pReg, const uint64_t& offset, const Direction& dir, void* pObj)
@@ -117,36 +158,25 @@ public:
 	}
 
 protected:
-	std::string className() const
-	{
-		int status;
-		char* pName = abi::__cxa_demangle(typeid(*this).name(), NULL, NULL, &status);
-		std::string name(pName);
-		free(pName);
-		return name;
-	}
-
 	// Register a register to the list of known registers and
 	// setup its update callback function
 	template<typename T>
-	void registerReg(Register<T>& reg, const uint64_t& offset = 0x0)
+	void registerReg(Register<T>& reg, const uint64_t& offset = 0x0, const PostRegisterReg& postReg = PostRegisterReg::RunPostRegFunction)
 	{
 		if constexpr (sizeof(T) > sizeof(uint64_t))
 		{
 			std::stringstream ss("");
-			ss << CLASS_TAG(className()) << "Registers with a size > " << sizeof(uint64_t) << " byte are currently not supported";
+			ss << CLASS_TAG_AUTO << nameTag() << "Registers with a size > " << sizeof(uint64_t) << " byte are currently not supported";
 			throw std::runtime_error(ss.str());
 		}
 
-		CLAP()->AddPollAddress(m_ctrlOffset + offset);
-
 		reg.SetupCallBackBasedUpdate(reinterpret_cast<void*>(this), offset, UpdateCallBack<T>);
 		m_registers.push_back(&reg);
-	}
 
-	void registerPollOffset(const uint64_t& offset)
-	{
-		CLAP()->AddPollAddress(m_ctrlOffset + offset);
+		if(postReg == PostRegisterReg::RunUpdate)
+			reg.Update(Direction::READ);
+		else if(postReg == PostRegisterReg::RunPostRegFunction)
+			reg.PostRegistration();
 	}
 
 	template<typename T>
@@ -164,7 +194,7 @@ protected:
 				return static_cast<T>(CLAP()->Read8(m_ctrlOffset + regOffset));
 			default:
 				std::stringstream ss("");
-				ss << CLASS_TAG(className()) << "Registers with a size > " << sizeof(uint64_t) << " byte are currently not supported";
+				ss << CLASS_TAG_AUTO << nameTag() << "Registers with a size > " << sizeof(uint64_t) << " byte are currently not supported";
 				throw std::runtime_error(ss.str());
 		}
 	}
@@ -188,7 +218,7 @@ protected:
 				break;
 			default:
 				std::stringstream ss("");
-				ss << CLASS_TAG(className()) << "Registers with a size > " << sizeof(uint64_t) << " byte are currently not supported";
+				ss << CLASS_TAG_AUTO << nameTag() << "Registers with a size > " << sizeof(uint64_t) << " byte are currently not supported";
 				throw std::runtime_error(ss.str());
 		}
 
@@ -198,7 +228,7 @@ protected:
 			if (readData != regData)
 			{
 				std::stringstream ss("");
-				ss << CLASS_TAG(className()) << "Register write validation failed. Expected: 0x" << std::hex << regData << ", Read: 0x" << readData << std::dec;
+				ss << CLASS_TAG_AUTO << nameTag() << "Register write validation failed. Address: 0x" << std::hex << m_ctrlOffset + regOffset << " Expected: 0x" << regData << ", Read: 0x" << readData << std::dec;
 				throw std::runtime_error(ss.str());
 			}
 		}
@@ -209,8 +239,19 @@ protected:
 		Expected<uint32_t> res = CLAP()->GetUIOID(m_ctrlOffset);
 		if (res)
 		{
-			m_detectedInterruptID = static_cast<int32_t>(res.Value());
-			CLAP_LOG_INFO << CLASS_TAG(className()) << "Detected interrupt ID: " << m_detectedInterruptID << std::endl;
+			const bool intrPrntPrsnt = CLAP()->CheckUIOPropertyExists(m_ctrlOffset, "interrupt-parent");
+			if (intrPrntPrsnt)
+				m_detectedInterruptID = static_cast<int32_t>(res.Value());
+			else
+			{
+				Expected<std::vector<uint64_t>> intrs = CLAP()->ReadUIOPropertyVec(m_ctrlOffset, "interrupts");
+				if (intrs && intrs.Value().size() >= 2)
+					m_detectedInterruptID = intrs.Value()[0];
+				else
+					return false;
+			}
+
+			CLAP_IP_CORE_LOG_INFO << "Detected interrupt ID: " << m_detectedInterruptID << std::endl;
 			return true;
 		}
 
@@ -224,10 +265,19 @@ protected:
 		return CLAP()->GetDevNum();
 	}
 
+	std::string nameTag() const
+	{
+		if (m_name.empty())
+			return "";
+
+		return "[" + m_name + "] ";
+	}
+
 protected:
+	std::string m_name;
 	uint64_t m_ctrlOffset;
 	std::vector<RegisterIntf*> m_registers;
-	int32_t m_detectedInterruptID = -1;
+	int32_t m_detectedInterruptID = INTR_UNDEFINED;
 };
 } // namespace internal
 } // namespace clap

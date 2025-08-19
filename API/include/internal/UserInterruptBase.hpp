@@ -47,7 +47,6 @@
 #endif
 
 #include <cstdint>
-#include <functional>
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -71,10 +70,8 @@ class UserInterruptBase
 public:
 	UserInterruptBase() {}
 
-	virtual ~UserInterruptBase()
-	{
-		Unset();
-	}
+	// Don't call derived methods in the destructor
+	virtual ~UserInterruptBase() = default;
 
 	virtual void Init(const uint32_t& devNum, const uint32_t& interruptNum, HasInterrupt* pReg = nullptr) = 0;
 
@@ -84,24 +81,126 @@ public:
 
 	virtual bool WaitForInterrupt([[maybe_unused]] const int32_t& timeout = WAIT_INFINITE, [[maybe_unused]] const bool& runCallbacks = true) = 0;
 
-	void RegisterCallback([[maybe_unused]] const std::function<void(uint32_t)>& callback)
+	void RegisterCallback([[maybe_unused]] const IntrCallback& callback)
 	{
 		m_callbacks.push_back(callback);
 	}
 
-	void TransferCallbacks(UserInterruptBase* pInterrupt)
+	void SetIPCoreFinishCallback(const IPCoreFinishCallback& callback)
 	{
-		for (auto& callback : m_callbacks)
+		m_ipCoreFinishCallback = callback;
+	}
+
+	void Transfer(UserInterruptBase* pInterrupt)
+	{
+		for (const auto& callback : m_callbacks)
 			pInterrupt->RegisterCallback(callback);
 
 		m_callbacks.clear();
+
+		pInterrupt->SetIPCoreFinishCallback(std::move(m_ipCoreFinishCallback));
+
+		pInterrupt->SetName(m_devName);
+		pInterrupt->SetInterruptNum(m_interruptNum);
+		pInterrupt->SetReg(m_pReg);
+	}
+
+	bool HasStatusReg() const
+	{
+		return m_pReg != nullptr;
+	}
+
+	bool HasDoneIntr() const
+	{
+		if (!IsSet())
+			BUILD_EXCEPTION(UserInterruptException, "Interrupt Status Register is not set, HasDoneIntr can only be called when a status register as been set.");
+
+		return m_pReg->HasDoneIntr();
+	}
+
+	bool HasErrorIntr() const
+	{
+		if (!IsSet())
+			BUILD_EXCEPTION(UserInterruptException, "Interrupt Status Register is not set, HasErrorIntr can only be called when a status register as been set.");
+
+		return m_pReg->HasErrorIntr();
+	}
+
+	void ResetStates()
+	{
+		if (!IsSet())
+			BUILD_EXCEPTION(UserInterruptException, "Interrupt Status Register is not set, ResetStates can only be called when a status register as been set.");
+
+		m_pReg->ResetStates();
+	}
+
+	void Reset()
+	{
+		if (!IsSet())
+			BUILD_EXCEPTION(UserInterruptException, "Interrupt Status Register is not set, Reset can only be called when a status register as been set.");
+
+		m_pReg->Reset();
+	}
+
+	bool HasFinishedCallback() const
+	{
+		return m_ipCoreFinishCallback != nullptr;
+	}
+
+	bool IsIpCoreFinished() const
+	{
+		if (!IsSet())
+			BUILD_EXCEPTION(UserInterruptException, "Interrupt is unset, IsIpCoreFinished can only be called on set interrupts, if the interrupt is not set please check the finish state using the CallIpCoreFinishCallback() method.");
+
+		return m_isIpCoreFinished;
+	}
+
+	bool CallIpCoreFinishCallback()
+	{
+		if (IsSet())
+			BUILD_EXCEPTION(UserInterruptException, "Interrupt is set, CallIpCoreFinishCallback can only be called on unset interrupts, as for set interrupts this is automatically done when an interrupt is received. Please check the finish state using the IsIpCoreFinished() method.");
+
+		if (m_ipCoreFinishCallback)
+			return m_ipCoreFinishCallback();
+		else // If the callback is not set, return true as the core is finished
+			return true;
+	}
+
+	void SetName(const std::string& name)
+	{
+		m_devName = name;
+	}
+
+	void SetInterruptNum(const uint32_t& interruptNum)
+	{
+		m_interruptNum = interruptNum;
+	}
+
+	void SetReg(HasInterrupt* pReg)
+	{
+		m_pReg = pReg;
 	}
 
 protected:
-	std::string m_devName                                  = "";
-	HasInterrupt* m_pReg                                   = nullptr;
-	std::vector<std::function<void(uint32_t)>> m_callbacks = {};
-	uint32_t m_interruptNum                                = 0;
+	void processCallbacks(const bool& runCallbacks, const uint32_t& lastIntr)
+	{
+		if (runCallbacks)
+		{
+			for (const auto& callback : m_callbacks)
+				callback(lastIntr);
+		}
+
+		if (m_ipCoreFinishCallback)
+			m_isIpCoreFinished = m_ipCoreFinishCallback();
+	}
+
+protected:
+	std::string m_devName                       = "";
+	HasInterrupt* m_pReg                        = nullptr;
+	std::vector<IntrCallback> m_callbacks       = {};
+	IPCoreFinishCallback m_ipCoreFinishCallback = nullptr;
+	uint32_t m_interruptNum                     = 0;
+	bool m_isIpCoreFinished                     = false;
 };
 } // namespace internal
 } // namespace clap

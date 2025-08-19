@@ -87,8 +87,33 @@ public:
 		return ap_idle;
 	}
 
+	void Reset() override
+	{
+		reset();
+	}
+
+	bool IsDone() override
+	{
+		if (!m_running) return false;
+		if (m_done) return m_done;
+		getStatus();
+		return m_done;
+	}
+
+	const bool& IsRunning()
+	{
+		getStatus();
+		return m_running;
+	}
+
+	void Prestart()
+	{
+		m_done    = false;
+		m_running = false;
+	}
+
 private:
-	void getStatus()
+	void getStatus() override
 	{
 		Update();
 
@@ -106,6 +131,19 @@ private:
 			m_done    = true;
 			m_running = false;
 		}
+	}
+
+	void reset()
+	{
+		m_done       = false;
+		m_running    = false;
+		ap_start     = false;
+		auto_restart = false;
+
+		Update(Direction::WRITE);
+
+		// Call base class reset
+		HasStatus::Reset();
 	}
 
 private:

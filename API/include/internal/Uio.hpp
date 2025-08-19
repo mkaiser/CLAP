@@ -28,6 +28,7 @@
 
 #include <arpa/inet.h>
 #include <cstdint>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <memory>
@@ -86,7 +87,7 @@ class UioDev
 			m_path(path)
 		{}
 
-		uint32_t GetId() const
+		const uint32_t& GetId() const
 		{
 			return m_id;
 		}
@@ -102,11 +103,11 @@ class UioDev
 		{
 			return m_offset;
 		}
-		std::string GetName() const
+		const std::string& GetName() const
 		{
 			return m_name;
 		}
-		std::string GetPath() const
+		const std::string& GetPath() const
 		{
 			return m_path;
 		}
@@ -138,7 +139,7 @@ class UioDev
 			m_fd = OpenDevice(m_path, O_RDWR);
 			if (m_fd == INVALID_HANDLE)
 			{
-				CLAP_LOG_ERROR << CLASS_TAG("MMDev") << "Could not open the device \"" << m_path << "\"" << std::endl;
+				CLAP_CLASS_LOG_ERROR << "Could not open the device \"" << m_path << "\"" << std::endl;
 				m_valid = false;
 				return;
 			}
@@ -146,7 +147,7 @@ class UioDev
 			m_pPtr = mmap(0, m_size, PROT_READ | PROT_WRITE, MAP_SHARED, m_fd, 0);
 			if (m_pPtr == MAP_FAILED)
 			{
-				CLAP_LOG_ERROR << CLASS_TAG("MMDev") << "Could not map the device \"" << m_path << "\"" << std::endl;
+				CLAP_CLASS_LOG_ERROR << "Could not map the device \"" << m_path << "\"" << std::endl;
 				m_valid = false;
 				return;
 			}
@@ -191,7 +192,7 @@ public:
 		m_devTreePropPath(path + UIO_OF_NODE_PATH),
 		m_id(id)
 	{
-		if (m_id == MINUS_ONE || m_name.empty() || m_path.empty())
+		if (m_id == MINUS_ONE_U || m_name.empty() || m_path.empty())
 		{
 			m_valid = false;
 			return;
@@ -223,7 +224,7 @@ public:
 		if (!m_valid)
 		{
 			std::stringstream ss;
-			ss << CLASS_TAG("UioDev") << "Device \"" << m_name << "\" is not valid" << std::endl;
+			ss << CLASS_TAG_AUTO << "Device \"" << m_name << "\" is not valid" << std::endl;
 			throw UIOException(ss.str());
 		}
 
@@ -231,7 +232,7 @@ public:
 		if (!m_maps[0].AddrInRange(addr))
 		{
 			std::stringstream ss;
-			ss << CLASS_TAG("UioDev") << "Address \"" << addr << "\" is not in range of device \"" << m_name << "\"" << std::endl;
+			ss << CLASS_TAG_AUTO << "Address \"" << addr << "\" is not in range of device \"" << m_name << "\"" << std::endl;
 			throw UIOException(ss.str());
 		}
 
@@ -287,14 +288,14 @@ public:
 		if (!m_valid)
 		{
 			std::stringstream ss;
-			ss << CLASS_TAG("UioDev") << "Device \"" << m_name << "\" is not valid" << std::endl;
+			ss << CLASS_TAG_AUTO << "Device \"" << m_name << "\" is not valid" << std::endl;
 			throw UIOException(ss.str());
 		}
 
 		if (!m_maps[0].AddrInRange(addr))
 		{
 			std::stringstream ss;
-			ss << CLASS_TAG("UioDev") << "Address \"" << addr << "\" is not in range of device \"" << m_name << "\"" << std::endl;
+			ss << CLASS_TAG_AUTO << "Address \"" << addr << "\" is not in range of device \"" << m_name << "\"" << std::endl;
 			throw UIOException(ss.str());
 		}
 
@@ -352,7 +353,7 @@ public:
 		std::ifstream file(m_devTreePropPath + name);
 		if (!file.is_open())
 		{
-			CLAP_LOG_ERROR << CLASS_TAG("UioDev") << "Could not open property \"" << name << "\" - path=" << m_devTreePropPath + name << std::endl;
+			CLAP_CLASS_LOG_ERROR << "Could not open property \"" << name << "\" - path=" << m_devTreePropPath + name << std::endl;
 			return MakeUnexpected();
 		}
 
@@ -417,6 +418,11 @@ public:
 		return resValues;
 	}
 
+	bool CheckPropertyExists(const std::string& property) const
+	{
+		return std::filesystem::exists(m_devTreePropPath + property);
+	}
+
 	const std::string& GetName() const
 	{
 		return m_name;
@@ -444,9 +450,7 @@ public:
 
 	bool HasAddr(const T& addr) const
 	{
-		for (const auto& map : m_maps)
-			if (map.AddrInRange(addr)) return true;
-		return false;
+		return std::any_of(m_maps.begin(), m_maps.end(), [addr](const UioMap<T>& map) { return map.AddrInRange(addr); });
 	}
 
 	friend std::ostream& operator<<(std::ostream& os, const UioDev& uioDev)
@@ -509,7 +513,7 @@ private:
 		// Check if the file is open
 		if (!propFile.is_open())
 		{
-			// CLAP_LOG_ERROR << CLASS_TAG("") << "Could not open the property file \"" << propertyPath << "\"" << std::endl;
+			// CLAP_CLASS_LOG_ERROR << "Could not open the property file \"" << propertyPath << "\"" << std::endl;
 			return propValue;
 		}
 
@@ -545,9 +549,34 @@ private:
 				break;
 			default:
 			{
-				std::stringstream ss;
-				ss << CLASS_TAG("UioDev") << "Reading \"" << bytes << "\" unaligned bytes is not supported" << std::endl;
-				throw UIOException(ss.str());
+				T bytesLeft = bytes;
+				T cAddr = addr;
+				uint8_t* cData = reinterpret_cast<uint8_t*>(pData);
+
+				while (bytesLeft > 0)
+				{
+					if (bytesLeft >= 4)
+					{
+						readSingle<uint32_t>(cAddr, reinterpret_cast<uint32_t*>(cData));
+						cAddr += 4;
+						cData += 4;
+						bytesLeft -= 4;
+					}
+					else if (bytesLeft >= 2)
+					{
+						readSingle<uint16_t>(cAddr, reinterpret_cast<uint16_t*>(cData));
+						cAddr += 2;
+						cData += 2;
+						bytesLeft -= 2;
+					}
+					else
+					{
+						readSingle<uint8_t>(cAddr, reinterpret_cast<uint8_t*>(cData));
+						cAddr += 1;
+						cData += 1;
+						bytesLeft -= 1;
+					}
+				}
 			}
 			break;
 		}
@@ -559,14 +588,14 @@ private:
 		if (!m_valid)
 		{
 			std::stringstream ss;
-			ss << CLASS_TAG("UioDev") << "Device \"" << m_name << "\" is not valid" << std::endl;
+			ss << CLASS_TAG_AUTO << "Device \"" << m_name << "\" is not valid" << std::endl;
 			throw UIOException(ss.str());
 		}
 
 		if (!m_maps[0].AddrInRange(addr))
 		{
 			std::stringstream ss;
-			ss << CLASS_TAG("UioDev") << "Address \"" << addr << "\" is not in range of device \"" << m_name << "\"" << std::endl;
+			ss << CLASS_TAG_AUTO << "Address \"" << addr << "\" is not in range of device \"" << m_name << "\"" << std::endl;
 			throw UIOException(ss.str());
 		}
 
@@ -595,9 +624,34 @@ private:
 				break;
 			default:
 			{
-				std::stringstream ss;
-				ss << CLASS_TAG("UioDev") << "Writing \"" << bytes << "\" unaligned bytes is not supported" << std::endl;
-				throw UIOException(ss.str());
+				T bytesLeft = bytes;
+				T cAddr = addr;
+				const uint8_t* cData = reinterpret_cast<const uint8_t*>(pData);
+
+				while (bytesLeft > 0)
+				{
+					if (bytesLeft >= 4)
+					{
+						writeSingle<uint32_t>(cAddr, *reinterpret_cast<const uint32_t*>(cData));
+						cAddr += 4;
+						cData += 4;
+						bytesLeft -= 4;
+					}
+					else if (bytesLeft >= 2)
+					{
+						writeSingle<uint16_t>(cAddr, *reinterpret_cast<const uint16_t*>(cData));
+						cAddr += 2;
+						cData += 2;
+						bytesLeft -= 2;
+					}
+					else
+					{
+						writeSingle<uint8_t>(cAddr, *cData);
+						cAddr += 1;
+						cData += 1;
+						bytesLeft -= 1;
+					}
+				}
 			}
 			break;
 		}
@@ -609,14 +663,14 @@ private:
 		if (!m_valid)
 		{
 			std::stringstream ss;
-			ss << CLASS_TAG("UioDev") << "Device \"" << m_name << "\" is not valid" << std::endl;
+			ss << CLASS_TAG_AUTO << "Device \"" << m_name << "\" is not valid" << std::endl;
 			throw UIOException(ss.str());
 		}
 
 		if (!m_maps[0].AddrInRange(addr))
 		{
 			std::stringstream ss;
-			ss << CLASS_TAG("UioDev") << "Address \"" << addr << "\" is not in range of device \"" << m_name << "\"" << std::endl;
+			ss << CLASS_TAG_AUTO << "Address \"" << addr << "\" is not in range of device \"" << m_name << "\"" << std::endl;
 			throw UIOException(ss.str());
 		}
 
@@ -711,33 +765,30 @@ public:
 
 	const UioDev<T>& FindUioDevByName(const std::string& name) const
 	{
-		for (const UioDev<T>& uioDev : m_uioDevs)
-		{
-			if (uioDev.GetName() == name)
-				return uioDev;
-		}
+		auto it = std::find_if(m_uioDevs.begin(), m_uioDevs.end(), [&name](const UioDev<T>& uioDev) { return uioDev.GetName() == name; });
+
+		if (it != m_uioDevs.end())
+			return *it;
 
 		return m_invalidUioDev;
 	}
 
 	const UioDev<T>& FindUioDevById(const uint32_t& id) const
 	{
-		for (const UioDev<T>& uioDev : m_uioDevs)
-		{
-			if (uioDev.GetId() == id)
-				return uioDev;
-		}
+		auto it = std::find_if(m_uioDevs.begin(), m_uioDevs.end(), [&id](const UioDev<T>& uioDev) { return uioDev.GetId() == id; });
+
+		if (it != m_uioDevs.end())
+			return *it;
 
 		return m_invalidUioDev;
 	}
 
 	const UioDev<T>& FindUioDevByAddr(const T& addr) const
 	{
-		for (const UioDev<T>& uioDev : m_uioDevs)
-		{
-			if (uioDev.HasAddr(addr))
-				return uioDev;
-		}
+		auto it = std::find_if(m_uioDevs.begin(), m_uioDevs.end(), [&addr](const UioDev<T>& uioDev) { return uioDev.HasAddr(addr); });
+
+		if (it != m_uioDevs.end())
+			return *it;
 
 		return m_invalidUioDev;
 	}

@@ -39,6 +39,22 @@
 
 // TODO: Implement non-interrupt status check
 
+#define AXI_GPIO_INVALID_CHANNEL_EXCEPTION                             \
+	{                                                                  \
+		std::stringstream ss("");                                      \
+		ss << CLAP_IP_EXCEPTION_TAG << "Invalid channel: " << channel; \
+		throw std::runtime_error(ss.str());                            \
+	}
+
+#define AXI_GPIO_INVALID_PORT_EXCEPTION                           \
+	{                                                             \
+		std::stringstream ss("");                                 \
+		ss << CLAP_IP_EXCEPTION_TAG << "Specified Port: " << port \
+		   << " is outside of the channels (" << channel << ") "  \
+		   << "range of enabled ports: " << m_gpioWidth[channel]; \
+		throw std::runtime_error(ss.str());                       \
+	}
+
 namespace clap
 {
 class AxiGPIO : public internal::RegisterControlBase
@@ -75,6 +91,8 @@ public:
 		No  = false
 	};
 
+	using IntrCallback = std::function<void(const Channel&, const uint32_t&, const bool&)>;
+
 private:
 	DISABLE_COPY_ASSIGN_MOVE(AxiGPIO)
 
@@ -89,16 +107,14 @@ private:
 		ADDR_IP_ISR     = 0x120
 	};
 
-	using InterruptFunc = std::function<void(const Channel&, const uint32_t&, const bool&)>;
-
 public:
-	AxiGPIO(const CLAPPtr& pClap, const uint64_t& ctrlOffset, const ResetOnInit& resetOnInit) :
-		AxiGPIO(pClap, ctrlOffset, DualChannel::No, resetOnInit)
+	AxiGPIO(const CLAPPtr& pClap, const uint64_t& ctrlOffset, const ResetOnInit& resetOnInit, const std::string& name = "") :
+		AxiGPIO(pClap, ctrlOffset, DualChannel::No, resetOnInit, name)
 	{
 	}
 
-	AxiGPIO(const CLAPPtr& pClap, const uint64_t& ctrlOffset, const DualChannel& dualChannel = DualChannel::No, const ResetOnInit& resetOnInit = ResetOnInit::Yes) :
-		RegisterControlBase(pClap, ctrlOffset),
+	AxiGPIO(const CLAPPtr& pClap, const uint64_t& ctrlOffset, const DualChannel& dualChannel = DualChannel::No, const ResetOnInit& resetOnInit = ResetOnInit::Yes, const std::string& name = "") :
+		RegisterControlBase(pClap, ctrlOffset, name),
 		m_watchDog("AxiGPIO", pClap->MakeUserInterrupt()),
 		m_isDualChannel((dualChannel == DualChannel::Yes))
 	{
@@ -111,7 +127,7 @@ public:
 		registerReg<uint32_t>(m_ipIntrEn, ADDR_IP_IER);
 		registerReg<uint32_t>(m_ipIntrStatus, ADDR_IP_ISR);
 
-		m_watchDog.SetFinishCallback(std::bind(&AxiGPIO::OnFinished, this));
+		m_watchDog.SetIPCoreFinishCallback(std::bind(&AxiGPIO::OnFinished, this));
 		m_watchDog.RegisterInterruptCallback(std::bind(&AxiGPIO::InterruptTriggered, this, std::placeholders::_1));
 
 		detectDualChannel();
@@ -123,13 +139,14 @@ public:
 			Reset();
 	}
 
-	virtual ~AxiGPIO()
+	virtual ~AxiGPIO() override
 	{
 		Stop();
 	}
 
 	void Reset()
 	{
+		Stop();
 		m_gpio1Data.Reset(m_dataDefaultValues[0]);
 		m_gpio1Tri.Reset(m_triDefaultValues[0]);
 		m_gpio2Data.Reset(m_dataDefaultValues[1]);
@@ -152,12 +169,22 @@ public:
 			m_gpioWidth[1] = width;
 	}
 
+	void SetGPIOWidths(const std::array<uint32_t, 2>& widths)
+	{
+		m_gpioWidth = widths;
+	}
+
 	void SetTriStateDefaultValue(const Channel& channel, const uint32_t& value)
 	{
 		if (channel == CHANNEL_1)
 			m_triDefaultValues[0] = value;
 		else if (channel == CHANNEL_2)
 			m_triDefaultValues[1] = value;
+	}
+
+	void SetTriStateDefaultValues(const std::array<uint32_t, 2>& values)
+	{
+		m_triDefaultValues = values;
 	}
 
 	void SetDataDefaultValue(const Channel& channel, const uint32_t& value)
@@ -168,11 +195,16 @@ public:
 			m_dataDefaultValues[1] = value;
 	}
 
+	void SetDataDefaultValues(const std::array<uint32_t, 2>& values)
+	{
+		m_dataDefaultValues = values;
+	}
+
 	void EnableInterrupts(const uint32_t& eventNo = USE_AUTO_DETECT, const GPIOInterrupts& intr = INTR_ALL)
 	{
 		uint32_t intrID = eventNo;
 
-		if (m_detectedInterruptID != -1)
+		if (m_detectedInterruptID != INTR_UNDEFINED)
 			intrID = static_cast<uint32_t>(m_detectedInterruptID);
 
 		m_globalIntrEn.SetGlobalInterruptEnable(true);
@@ -186,7 +218,7 @@ public:
 		m_watchDog.SetUserInterrupt(axiIntC.MakeUserInterrupt());
 	}
 
-	void RegisterInterruptCallback(const InterruptFunc& callback)
+	void RegisterInterruptCallback(const IntrCallback& callback)
 	{
 		m_callbacks.push_back(callback);
 	}
@@ -205,7 +237,7 @@ public:
 
 		if (m_watchDog && !m_watchDog.Start(true))
 		{
-			CLAP_LOG_ERROR << CLASS_TAG("AxiGPIO") << "Trying to start GPIO at: 0x" << std::hex << m_ctrlOffset << " which is already running, stopping startup ..." << std::endl;
+			CLAP_IP_CORE_LOG_ERROR << "Tried to start GPIO at: 0x" << std::hex << m_ctrlOffset << " which is already running, stopping startup ..." << std::endl;
 			return false;
 		}
 
@@ -217,10 +249,10 @@ public:
 	void Stop()
 	{
 		if (!m_running) return;
-		CLAP_LOG_INFO << CLASS_TAG("AxiGPIO") << "Stopping GPIO at: 0x" << std::hex << m_ctrlOffset << std::dec << " ... " << std::flush;
+		CLAP_IP_CORE_LOG_INFO << "Stopping GPIO at: 0x" << std::hex << m_ctrlOffset << std::dec << " ... " << std::flush;
 
 		m_watchDog.Stop();
-		m_watchDog.UnsetInterrupt();
+		// m_watchDog.UnsetInterrupt();
 
 		m_running = false;
 
@@ -229,24 +261,26 @@ public:
 
 	void SetGPIOState(const Channel& channel, const uint32_t& port, const PortStates& state)
 	{
-		if (port > m_gpioWidth[channel]) return;
+		if (port > m_gpioWidth[channel]) AXI_GPIO_INVALID_PORT_EXCEPTION
 
 		if (channel == CHANNEL_1)
 			m_gpio1Tri.SetBitAt(port, state);
 		else if (channel == CHANNEL_2 && m_isDualChannel)
 			m_gpio2Tri.SetBitAt(port, state);
+
+		AXI_GPIO_INVALID_CHANNEL_EXCEPTION
 	}
 
 	uint8_t GetGPIOBit(const Channel& channel, const uint32_t& port)
 	{
-		if (port > m_gpioWidth[channel]) return -1;
+		if (port > m_gpioWidth[channel]) AXI_GPIO_INVALID_PORT_EXCEPTION
 
 		if (channel == CHANNEL_1)
 			return m_gpio1Data.GetBitAt(port);
 		else if (channel == CHANNEL_2 && m_isDualChannel)
 			return m_gpio2Data.GetBitAt(port);
 
-		return -1;
+		AXI_GPIO_INVALID_CHANNEL_EXCEPTION
 	}
 
 	uint32_t GetGPIOBits(const Channel& channel)
@@ -256,17 +290,21 @@ public:
 		else if (channel == CHANNEL_2 && m_isDualChannel)
 			return m_gpio2Data.ToUint32();
 
-		return 0;
+		AXI_GPIO_INVALID_CHANNEL_EXCEPTION
 	}
 
 	void SetGPIOBit(const Channel& channel, const uint32_t& port, const bool& value)
 	{
-		if (port > m_gpioWidth[channel]) return;
+		if (port > m_gpioWidth[channel]) AXI_GPIO_INVALID_PORT_EXCEPTION
 
 		if (channel == CHANNEL_1)
 			m_gpio1Data.SetBitAt(port, value);
 		else if (channel == CHANNEL_2 && m_isDualChannel)
 			m_gpio2Data.SetBitAt(port, value);
+		else
+		{
+			AXI_GPIO_INVALID_CHANNEL_EXCEPTION
+		}
 	}
 
 	void SetGPIOBits(const Channel& channel, const uint32_t& value)
@@ -275,6 +313,10 @@ public:
 			m_gpio1Data.SetBits(value);
 		else if (channel == CHANNEL_2 && m_isDualChannel)
 			m_gpio2Data.SetBits(value);
+		else
+		{
+			AXI_GPIO_INVALID_CHANNEL_EXCEPTION
+		}
 	}
 
 	void InterruptTriggered([[maybe_unused]] const uint32_t& mask)
@@ -316,6 +358,10 @@ private:
 			oldValue = m_gpio2Data.GetBits(internal::Bit32Register::RegUpdate::NoUpdate);
 			newValue = m_gpio2Data.GetBits();
 		}
+		else
+		{
+			AXI_GPIO_INVALID_CHANNEL_EXCEPTION
+		}
 
 		std::transform(std::begin(oldValue), std::end(oldValue), std::begin(newValue), std::begin(changes), std::bit_xor<bool>());
 
@@ -328,7 +374,7 @@ private:
 		if (res)
 		{
 			m_isDualChannel = (static_cast<uint32_t>(res.Value()) != 0);
-			CLAP_LOG_INFO << CLASS_TAG("AxiGPIO") << "Detected dual channel mode: " << (m_isDualChannel ? "ON" : "OFF") << std::endl;
+			CLAP_IP_CORE_LOG_INFO << "Detected dual channel mode: " << (m_isDualChannel ? "ON" : "OFF") << std::endl;
 		}
 	}
 
@@ -338,17 +384,17 @@ private:
 		if (res)
 		{
 			m_gpioWidth[0] = static_cast<uint32_t>(res.Value());
-			CLAP_LOG_INFO << CLASS_TAG("AxiGPIO") << "Detected GPIO width for channel 1: " << m_gpioWidth[0] << std::endl;
+			CLAP_IP_CORE_LOG_INFO << "Detected GPIO width for channel 1: " << m_gpioWidth[0] << std::endl;
 		}
 
 		if (m_isDualChannel)
 		{
 			// The shadowing here is intentional, as Expected currently does not allow overwriting the value
-			Expected<uint64_t> res = CLAP()->ReadUIOProperty(m_ctrlOffset, "xlnx,gpio2-width");
-			if (res)
+			Expected<uint64_t> res2 = CLAP()->ReadUIOProperty(m_ctrlOffset, "xlnx,gpio2-width");
+			if (res2)
 			{
-				m_gpioWidth[1] = static_cast<uint32_t>(res.Value());
-				CLAP_LOG_INFO << CLASS_TAG("AxiGPIO") << "Detected GPIO width for channel 2: " << m_gpioWidth[1] << std::endl;
+				m_gpioWidth[1] = static_cast<uint32_t>(res2.Value());
+				CLAP_IP_CORE_LOG_INFO << "Detected GPIO width for channel 2: " << m_gpioWidth[1] << std::endl;
 			}
 		}
 	}
@@ -359,17 +405,17 @@ private:
 		if (res)
 		{
 			m_triDefaultValues[0] = static_cast<uint32_t>(res.Value());
-			CLAP_LOG_INFO << CLASS_TAG("AxiGPIO") << "Detected GPIO tri state default for channel 1: 0x" << std::hex << m_triDefaultValues[0] << std::dec << std::endl;
+			CLAP_IP_CORE_LOG_INFO << "Detected GPIO tri state default for channel 1: 0x" << std::hex << m_triDefaultValues[0] << std::dec << std::endl;
 		}
 
 		if (m_isDualChannel)
 		{
 			// The shadowing here is intentional, as Expected currently does not allow overwriting the value
-			Expected<uint64_t> res = CLAP()->ReadUIOProperty(m_ctrlOffset, "xlnx,tri-default-2");
-			if (res)
+			Expected<uint64_t> res2 = CLAP()->ReadUIOProperty(m_ctrlOffset, "xlnx,tri-default-2");
+			if (res2)
 			{
-				m_triDefaultValues[1] = static_cast<uint32_t>(res.Value());
-				CLAP_LOG_INFO << CLASS_TAG("AxiGPIO") << "Detected GPIO tri state default for channel 2: 0x" << std::hex << m_triDefaultValues[1] << std::dec << std::endl;
+				m_triDefaultValues[1] = static_cast<uint32_t>(res2.Value());
+				CLAP_IP_CORE_LOG_INFO << "Detected GPIO tri state default for channel 2: 0x" << std::hex << m_triDefaultValues[1] << std::dec << std::endl;
 			}
 		}
 	}
@@ -380,17 +426,17 @@ private:
 		if (res)
 		{
 			m_dataDefaultValues[0] = static_cast<uint32_t>(res.Value());
-			CLAP_LOG_INFO << CLASS_TAG("AxiGPIO") << "Detected GPIO data default for channel 1: 0x" << std::hex << m_dataDefaultValues[0] << std::dec << std::endl;
+			CLAP_IP_CORE_LOG_INFO << "Detected GPIO data default for channel 1: 0x" << std::hex << m_dataDefaultValues[0] << std::dec << std::endl;
 		}
 
 		if (m_isDualChannel)
 		{
 			// The shadowing here is intentional, as Expected currently does not allow overwriting the value
-			Expected<uint64_t> res = CLAP()->ReadUIOProperty(m_ctrlOffset, "xlnx,dout-default-2");
-			if (res)
+			Expected<uint64_t> res2 = CLAP()->ReadUIOProperty(m_ctrlOffset, "xlnx,dout-default-2");
+			if (res2)
 			{
-				m_dataDefaultValues[1] = static_cast<uint32_t>(res.Value());
-				CLAP_LOG_INFO << CLASS_TAG("AxiGPIO") << "Detected GPIO data default for channel 2: 0x" << std::hex << m_dataDefaultValues[1] << std::dec << std::endl;
+				m_dataDefaultValues[1] = static_cast<uint32_t>(res2.Value());
+				CLAP_IP_CORE_LOG_INFO << "Detected GPIO data default for channel 2: 0x" << std::hex << m_dataDefaultValues[1] << std::dec << std::endl;
 			}
 		}
 	}
@@ -439,24 +485,18 @@ private:
 			Bit32Register("IP Interrupt Status Register")
 		{
 			// Do an initial clear to discard old interrupts
-			ClearInterrupts();
+			clearInterrupts();
 			m_lastInterrupt = 0;
 		}
 
-		void ClearInterrupts()
+		void ClearInterrupts() override
 		{
-			m_lastInterrupt = GetInterrupts();
-			ResetInterrupts(INTR_ALL);
+			clearInterrupts();
 		}
 
-		uint32_t GetInterrupts()
+		uint32_t GetInterrupts() override
 		{
-			Update();
-			uint32_t intr = 0;
-			intr |= m_bits[0] << (INTR_ON_CH1 >> 1);
-			intr |= m_bits[1] << (INTR_ON_CH2 >> 1);
-
-			return intr;
+			return getInterrupts();
 		}
 
 		void ResetInterrupts(const GPIOInterrupts& intr)
@@ -467,6 +507,46 @@ private:
 				m_bits[1] = true;
 
 			Update(internal::Direction::WRITE);
+		}
+
+		void Reset() override
+		{
+			reset();
+		}
+
+		void ResetStates() override
+		{
+			resetStates();
+		}
+
+	private:
+		void clearInterrupts()
+		{
+			m_lastInterrupt = getInterrupts();
+			ResetInterrupts(INTR_ALL);
+		}
+
+		uint32_t getInterrupts()
+		{
+			Update();
+			uint32_t intr = 0;
+			intr |= m_bits[0] << (INTR_ON_CH1 >> 1);
+			intr |= m_bits[1] << (INTR_ON_CH2 >> 1);
+
+			return intr;
+		}
+
+		void resetStates()
+		{
+			m_lastInterrupt = 0;
+			m_bits[0]       = false;
+			m_bits[1]       = false;
+		}
+
+		void reset()
+		{
+			clearInterrupts();
+			resetStates();
 		}
 	};
 
@@ -514,7 +594,7 @@ private:
 	IPInterruptEnableRegister m_ipIntrEn     = IPInterruptEnableRegister();
 	IPInterruptStatusRegister m_ipIntrStatus = IPInterruptStatusRegister();
 
-	std::vector<InterruptFunc> m_callbacks = {};
+	std::vector<IntrCallback> m_callbacks = {};
 	bool m_isDualChannel;
 	std::array<uint32_t, 2> m_gpioWidth         = { 32, 32 };
 	std::array<uint32_t, 2> m_triDefaultValues  = { 0xFFFFFFFF, 0xFFFFFFFF };

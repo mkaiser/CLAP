@@ -26,10 +26,15 @@
 
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <vector>
 
 #include "Constants.hpp"
+
+#ifndef EMBEDDED_XILINX
+#include "AlignmentAllocator.hpp"
+#endif
 
 namespace clap
 {
@@ -37,7 +42,6 @@ namespace clap
 template<class T>
 using CLAPBufferAllocator = std::allocator<T>;
 #else
-#include "AlignmentAllocator.hpp"
 template<class T>
 using CLAPBufferAllocator = clap::internal::AlignmentAllocator<T, ALIGNMENT>;
 #endif
@@ -45,8 +49,14 @@ using CLAPBufferAllocator = clap::internal::AlignmentAllocator<T, ALIGNMENT>;
 template<class T>
 using CLAPBuffer = std::vector<T, CLAPBufferAllocator<T>>;
 
+using MemoryPtr = std::shared_ptr<class Memory>;
+using MemoryUPtr = std::unique_ptr<class Memory>;
+
 using CLAPPtr  = std::shared_ptr<class CLAP>;
 using Bit32Arr = std::array<bool, 32>;
+
+using IntrCallback         = std::function<void(uint32_t)>;
+using IPCoreFinishCallback = std::function<bool(void)>;
 
 namespace internal
 {

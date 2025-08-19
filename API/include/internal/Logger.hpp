@@ -26,11 +26,17 @@
 
 #pragma once
 
+#include <fstream>
 #include <iostream>
 #include <mutex>
 #include <sstream>
 
 #include "StdStub.hpp"
+#include "Utils.hpp"
+
+#ifdef CLAP_USE_XIL_PRINTF
+#include <xil_printf.h>
+#endif
 
 namespace clap
 {
@@ -54,7 +60,7 @@ using ManipType = std::ostream&(std::ostream&);
 class Logger
 {
 public:
-	Logger(const Verbosity& lvl, const Verbosity& verbosity = Verbosity::VB_INFO, std::ostream& outStream = std::cout) :
+	explicit Logger(const Verbosity& lvl, const Verbosity& verbosity = Verbosity::VB_INFO, std::ostream& outStream = std::cout) :
 		m_lvl(lvl),
 		m_verbosity(verbosity),
 		m_outStream(outStream)
@@ -63,6 +69,11 @@ public:
 	void SetVerbosity(const Verbosity& v)
 	{
 		m_verbosity = v;
+	}
+
+	void SetOutputFile(std::shared_ptr<std::ofstream> pOutFile)
+	{
+		m_pOutFile = std::move(pOutFile);
 	}
 
 	// Required for pure std::endl / std::flush calls (e.g. Logger << std::endl)
@@ -78,7 +89,16 @@ public:
 		std::lock_guard<std::mutex> lock(s_logMutex);
 
 		if (m_lvl >= m_verbosity)
+		{
+#ifdef CLAP_USE_XIL_PRINTF
+			xil_printf("%s\r", message.str().c_str());
+#else
 			m_outStream << message.str();
+
+			if (m_pOutFile && m_pOutFile->is_open())
+				*m_pOutFile << message.str();
+#endif
+		}
 
 		message.flush();
 	}
@@ -89,13 +109,19 @@ public:
 		std::lock_guard<std::mutex> lock(s_logMutex);
 
 		if (m_lvl >= m_verbosity)
+		{
 			m_outStream << manip;
+
+			if (m_pOutFile && m_pOutFile->is_open())
+				*m_pOutFile << manip;
+		}
 	}
 
 private:
 	Verbosity m_lvl;
 	Verbosity m_verbosity;
 	std::ostream& m_outStream;
+	std::shared_ptr<std::ofstream> m_pOutFile = nullptr;
 	static inline std::mutex s_logMutex;
 };
 
@@ -106,7 +132,7 @@ public:
 	LoggerBuffer& operator=(const LoggerBuffer&) = delete;
 	LoggerBuffer& operator=(LoggerBuffer&&)      = delete;
 
-	LoggerBuffer(Logger* pLogger) :
+	explicit LoggerBuffer(Logger* pLogger) :
 		m_stream(),
 		m_pLogger(pLogger)
 	{}
@@ -148,15 +174,117 @@ LoggerBuffer operator<<(Logger& logger, T&& message)
 	return buf;
 }
 
-#ifdef DISABLE_LOGGING
-static Logger g_none(Verbosity::VB_DEBUG, Verbosity::VB_NONE);
+class LoggerContainer
+{
+public:
+	LoggerContainer() = default;
+
+	~LoggerContainer()
+	{
+		if (m_pOutFile && m_pOutFile->is_open())
+			m_pOutFile->close();
+	}
+
+	Logger& GetLogger([[maybe_unused]] const Verbosity& v)
+	{
+#ifdef CLAP_DISABLE_LOGGING
+		return m_none;
 #else
-static Logger g_debug(Verbosity::VB_DEBUG);
-static Logger g_verbose(Verbosity::VB_VERBOSE);
-static Logger g_info(Verbosity::VB_INFO);
-static Logger g_warning(Verbosity::VB_WARNING, Verbosity::VB_INFO, std::cerr);
-static Logger g_error(Verbosity::VB_ERROR, Verbosity::VB_INFO, std::cerr);
+		switch (v)
+		{
+			case Verbosity::VB_DEBUG:
+				return m_debug;
+			case Verbosity::VB_VERBOSE:
+				return m_verbose;
+			case Verbosity::VB_INFO:
+				return m_info;
+			case Verbosity::VB_WARNING:
+				return m_warning;
+			case Verbosity::VB_ERROR:
+				return m_error;
+			default:
+				return m_info;
+		}
 #endif
+	}
+
+	void SetVerbosity([[maybe_unused]] const Verbosity& v)
+	{
+#ifndef CLAP_DISABLE_LOGGING
+		m_debug.SetVerbosity(v);
+		m_verbose.SetVerbosity(v);
+		m_info.SetVerbosity(v);
+		m_warning.SetVerbosity(v);
+		m_error.SetVerbosity(v);
+#endif
+	}
+
+	void Log2File(const std::string& fileName)
+	{
+		if (fileName.empty() && m_pOutFile && m_pOutFile->is_open())
+		{
+			m_debug.SetOutputFile(nullptr);
+			m_verbose.SetOutputFile(nullptr);
+			m_info.SetOutputFile(nullptr);
+			m_warning.SetOutputFile(nullptr);
+			m_error.SetOutputFile(nullptr);
+
+			m_pOutFile->close();
+			return;
+		}
+
+		m_pOutFile = std::make_shared<std::ofstream>(fileName, std::ios::app);
+		if (!m_pOutFile->is_open())
+		{
+			std::cerr << "[CLAP Logger] Failed to open log file: " << fileName << std::endl;
+			return;
+		}
+
+		m_pOutFile->setf(std::ios::unitbuf); // Ensure that the output is flushed after each write
+
+		// Write the header to the log file
+		*m_pOutFile << "==============================================================" << std::endl;
+		*m_pOutFile << "==============================================================" << std::endl;
+		*m_pOutFile << " ██████╗██╗      █████╗ ██████╗ " << std::endl;
+		*m_pOutFile << "██╔════╝██║     ██╔══██╗██╔══██╗" << std::endl;
+		*m_pOutFile << "██║     ██║     ███████║██████╔╝" << std::endl;
+		*m_pOutFile << "██║     ██║     ██╔══██║██╔═══╝ " << std::endl;
+		*m_pOutFile << "╚██████╗███████╗██║  ██║██║     " << std::endl;
+		*m_pOutFile << " ╚═════╝╚══════╝╚═╝  ╚═╝╚═╝     " << std::endl;
+		*m_pOutFile << "==============================================================" << std::endl;
+		*m_pOutFile << "CLAP Logger started at: " << utils::GetCurrentTime() << std::endl;
+		*m_pOutFile << "==============================================================" << std::endl;
+
+		m_debug.SetOutputFile(m_pOutFile);
+		m_verbose.SetOutputFile(m_pOutFile);
+		m_info.SetOutputFile(m_pOutFile);
+		m_warning.SetOutputFile(m_pOutFile);
+		m_error.SetOutputFile(m_pOutFile);
+	}
+
+private:
+#ifdef CLAP_DISABLE_LOGGING
+	Logger m_none = Logger(Verbosity::VB_DEBUG, Verbosity::VB_NONE);
+#else
+	Logger m_debug = Logger(Verbosity::VB_DEBUG);
+	Logger m_verbose = Logger(Verbosity::VB_VERBOSE);
+	Logger m_info = Logger(Verbosity::VB_INFO);
+	Logger m_warning = Logger(Verbosity::VB_WARNING, Verbosity::VB_INFO, std::cerr);
+	Logger m_error = Logger(Verbosity::VB_ERROR, Verbosity::VB_INFO, std::cerr);
+	std::shared_ptr<std::ofstream> m_pOutFile = nullptr;
+#endif
+};
+
+inline LoggerContainer& GetLoggers()
+{
+	static LoggerContainer loggers;
+	return loggers;
+}
+
+inline Logger& GetLogger(const Verbosity& v)
+{
+	return GetLoggers().GetLogger(v);
+}
 
 template<typename T>
 constexpr typename std::underlying_type<T>::type ToUnderlying(const T& t) noexcept
@@ -164,7 +292,7 @@ constexpr typename std::underlying_type<T>::type ToUnderlying(const T& t) noexce
 	return static_cast<typename std::underlying_type<T>::type>(t);
 }
 
-static inline Verbosity ToVerbosity(const int32_t& val)
+inline Verbosity ToVerbosity(const int32_t& val)
 {
 	if (val < ToUnderlying(Verbosity::VB_DEBUG) || val > ToUnderlying(Verbosity::VB_ERROR))
 		return Verbosity::VB_INFO;
@@ -172,34 +300,44 @@ static inline Verbosity ToVerbosity(const int32_t& val)
 	return static_cast<Verbosity>(val);
 }
 
-static inline void SetVerbosity([[maybe_unused]] const Verbosity& v)
+inline void SetVerbosity([[maybe_unused]] const Verbosity& v)
 {
-#ifndef DISABLE_LOGGING
-	g_debug.SetVerbosity(v);
-	g_verbose.SetVerbosity(v);
-	g_info.SetVerbosity(v);
-	g_warning.SetVerbosity(v);
-	g_error.SetVerbosity(v);
+#ifndef CLAP_DISABLE_LOGGING
+	GetLoggers().SetVerbosity(v);
+#endif
+}
+
+inline void Log2File([[maybe_unused]] const std::string& fileName)
+{
+#ifndef CLAP_DISABLE_LOGGING
+	GetLoggers().Log2File(fileName);
 #endif
 }
 
 } // namespace logging
 
-#ifndef DISABLE_LOGGING
-#define CLAP_LOG_DEBUG   logging::g_debug
-#define CLAP_LOG_VERBOSE logging::g_verbose
-#define CLAP_LOG_INFO    logging::g_info
-#define CLAP_LOG_WARNING logging::g_warning
-#define CLAP_LOG_ERROR   logging::g_error
+#ifdef CLAP_DISABLE_LOGGING
+#define CLAP_LOG_FLAG if (false)
 #else
-#define CLAP_LOG_DEBUG   logging::g_none
-#define CLAP_LOG_VERBOSE logging::g_none
-#define CLAP_LOG_INFO    logging::g_none
-#define CLAP_LOG_WARNING logging::g_none
-#define CLAP_LOG_ERROR   logging::g_none
+#define CLAP_LOG_FLAG
 #endif
 
-/// Info log messages that will not be disabled by the DISABLE_LOGGING macro
-#define CLAP_LOG_INFO_ALWAYS logging::g_info
+#define CLAP_LOG_DEBUG   CLAP_LOG_FLAG clap::logging::GetLogger(clap::logging::Verbosity::VB_DEBUG)
+#define CLAP_LOG_VERBOSE CLAP_LOG_FLAG clap::logging::GetLogger(clap::logging::Verbosity::VB_VERBOSE)
+#define CLAP_LOG_INFO    CLAP_LOG_FLAG clap::logging::GetLogger(clap::logging::Verbosity::VB_INFO)
+#define CLAP_LOG_WARNING CLAP_LOG_FLAG clap::logging::GetLogger(clap::logging::Verbosity::VB_WARNING)
+#define CLAP_LOG_ERROR   CLAP_LOG_FLAG clap::logging::GetLogger(clap::logging::Verbosity::VB_ERROR)
+
+#define CLAP_CLASS_LOG_DEBUG   CLAP_LOG_DEBUG << CLASS_TAG_AUTO
+#define CLAP_CLASS_LOG_VERBOSE CLAP_LOG_VERBOSE << CLASS_TAG_AUTO
+#define CLAP_CLASS_LOG_INFO    CLAP_LOG_INFO << CLASS_TAG_AUTO
+#define CLAP_CLASS_LOG_WARNING CLAP_LOG_WARNING << CLASS_TAG_AUTO
+#define CLAP_CLASS_LOG_ERROR   CLAP_LOG_ERROR << CLASS_TAG_AUTO
+
+#define CLAP_CLASS_LOG_WITH_NAME_DEBUG(_N_)   CLAP_LOG_DEBUG << CLASS_TAG_AUTO_WITH_NAME(_N_)
+#define CLAP_CLASS_LOG_WITH_NAME_VERBOSE(_N_) CLAP_LOG_VERBOSE << CLASS_TAG_AUTO_WITH_NAME(_N_)
+#define CLAP_CLASS_LOG_WITH_NAME_INFO(_N_)    CLAP_LOG_INFO << CLASS_TAG_AUTO_WITH_NAME(_N_)
+#define CLAP_CLASS_LOG_WITH_NAME_WARNING(_N_) CLAP_LOG_WARNING << CLASS_TAG_AUTO_WITH_NAME(_N_)
+#define CLAP_CLASS_LOG_WITH_NAME_ERROR(_N_)   CLAP_LOG_ERROR << CLASS_TAG_AUTO_WITH_NAME(_N_)
 
 } // namespace clap

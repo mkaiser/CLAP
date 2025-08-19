@@ -33,7 +33,7 @@ namespace internal
 #include <cstdlib>
 #include <malloc.h>
 
-static inline void* alignedMalloc(size_t alignment, size_t size) noexcept
+inline void* alignedMalloc(size_t alignment, size_t size) noexcept
 {
 #ifdef WIN32
 	return _aligned_malloc(size, alignment);
@@ -42,7 +42,7 @@ static inline void* alignedMalloc(size_t alignment, size_t size) noexcept
 #endif
 }
 
-static inline void alignedFree(void* ptr) noexcept
+inline void alignedFree(void* ptr) noexcept
 {
 #ifdef WIN32
 	_aligned_free(ptr);
@@ -95,6 +95,10 @@ public:
 	{
 		if (size == 0)
 			return nullptr;
+
+		// If the the size is not a multiple of the alignment, increase the size to the next multiple
+		if (size % Alignment != 0)
+			size += Alignment - (size % Alignment);
 
 		void* p = alignedMalloc(Alignment, size * sizeof(T));
 
