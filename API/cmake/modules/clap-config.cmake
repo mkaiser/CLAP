@@ -29,11 +29,14 @@ find_path(CLAP_INCLUDE_DIR
 	NAMES CLAP.hpp # look for this file 
 	PATH_SUFFIXES clap # tries /usr/include/clap
 	HINTS 
-		"${CMAKE_CURRENT_LIST_DIR}/../../" # existing relative (…/include)
+		"${CMAKE_CURRENT_LIST_DIR}/../../" # API
+		"${CMAKE_CURRENT_LIST_DIR}/../../include" # API/include
 		"/usr/include" 
 		"/usr/local/include" 
 	)
 
+message(STATUS "clap-config.cmake: CMAKE_CURRENT_LIST_DIR=${CMAKE_CURRENT_LIST_DIR}")
+message(STATUS "clap-config.cmake: CLAP_INCLUDE_DIR=${CLAP_INCLUDE_DIR}")
 
 # add plural form of CLAP_INCLUDE_DIR (--> DIRS) for backwards compatibility
 if (CLAP_INCLUDE_DIR) 
