@@ -35,8 +35,8 @@ find_path(CLAP_INCLUDE_DIR
 		"/usr/local/include" 
 	)
 
-message(STATUS "clap-config.cmake: CMAKE_CURRENT_LIST_DIR=${CMAKE_CURRENT_LIST_DIR}")
-message(STATUS "clap-config.cmake: CLAP_INCLUDE_DIR=${CLAP_INCLUDE_DIR}")
+# message(STATUS "clap-config.cmake: CMAKE_CURRENT_LIST_DIR=${CMAKE_CURRENT_LIST_DIR}")
+# message(STATUS "clap-config.cmake: CLAP_INCLUDE_DIR=${CLAP_INCLUDE_DIR}")
 
 # add plural form of CLAP_INCLUDE_DIR (--> DIRS) for backwards compatibility
 if (CLAP_INCLUDE_DIR) 
